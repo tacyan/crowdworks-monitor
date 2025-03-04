@@ -1,0 +1,5 @@
+flet>=0.20.0
+requests>=2.31.0
+beautifulsoup4>=4.12.2
+schedule>=1.2.1
+python-dateutil>=2.8.2 
