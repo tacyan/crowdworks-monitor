@@ -18,6 +18,7 @@ import logging
 import threading
 import webbrowser
 import smtplib
+import shutil
 from queue import Queue
 from typing import List, Dict, Any, Optional, Callable
 from email.mime.text import MIMEText
@@ -57,8 +58,7 @@ class JobMonitorApp:
     """
     
     # 人気キーワードのリスト（実際には動的に更新される）
-    POPULAR_KEYWORDS = ["Python", "データ分析", "AI", "機械学習", "Webスクレイピング", 
-                        "自動化", "API", "SQL", "Excel", "ChatGPT"]
+    POPULAR_KEYWORDS = ["Python", "データ分析", "AI", "機械学習", "Webスクレイピング"]
     
     def __init__(self, page: ft.Page):
         """
@@ -128,32 +128,39 @@ class JobMonitorApp:
             "smtp_server": "smtp.gmail.com",
             "smtp_port": 587,
             "username": "your.email@example.com",
-            "password": "your-app-password-here-xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-            "sender": "your.email@example.com",
+            "password": "",
             "recipient": "",
-            "subject_template": "クラウドワークス - 新着案件通知 ({count}件)",
-            "last_sent": None,
-            "simulation_mode": False,  # シミュレーションモードの追加
-            "auto_fallback": True     # 認証エラー時の自動フォールバック
+            "from_name": "クラウドワークス案件モニター"
         }
         
         try:
-            if os.path.exists(config_path):
-                with open(config_path, "r", encoding="utf-8") as f:
-                    config = json.load(f)
+            if not os.path.exists(config_path) or os.path.getsize(config_path) == 0:
+                # ファイルが存在しないか空の場合、デフォルト設定を保存して返す
+                with open(config_path, 'w', encoding='utf-8') as f:
+                    json.dump(default_config, f, ensure_ascii=False, indent=2)
+                logger.info("デフォルトのメール設定ファイルを作成しました")
+                return default_config
                 
-                # 互換性のために 'email' から 'recipient' へ変換
-                if "email" in config and not config.get("recipient"):
-                    config["recipient"] = config.pop("email")
-                
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
                 logger.info("メール設定を読み込みました")
                 return config
-            else:
-                # デフォルト設定を保存
-                with open(config_path, "w", encoding="utf-8") as f:
-                    json.dump(default_config, f, indent=2, ensure_ascii=False)
-                logger.info("デフォルトのメール設定を作成しました")
-                return default_config
+        except json.JSONDecodeError:
+            # JSON形式が不正な場合
+            logger.error("メール設定の読み込みに失敗しました: 不正なJSON形式です")
+            # バックアップを作成して新しいファイルを生成
+            if os.path.exists(config_path):
+                backup_path = f"{config_path}.bak"
+                try:
+                    shutil.copy(config_path, backup_path)
+                    logger.info(f"不正なメール設定ファイルを{backup_path}にバックアップしました")
+                except Exception as e:
+                    logger.error(f"バックアップの作成に失敗しました: {e}")
+            # デフォルト設定を保存
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(default_config, f, ensure_ascii=False, indent=2)
+            logger.info("デフォルトのメール設定ファイルを作成しました")
+            return default_config
         except Exception as e:
             logger.error(f"メール設定の読み込みに失敗しました: {e}")
             return default_config
@@ -169,15 +176,19 @@ class JobMonitorApp:
     
     def _init_ui_components(self):
         """UIコンポーネントの初期化"""
+        # 検索中断フラグの初期化
+        self.is_search_cancelled = False
+        
         # ステータステキスト
         self.status_text = ft.Text("準備完了", color=ft.colors.GREEN)
         
-        # 仕事リスト
+        # 案件リスト表示用コンテナ
         self.job_list = ft.ListView(
             expand=True,
             spacing=10,
             padding=20,
-            auto_scroll=False
+            auto_scroll=False,  # 自動スクロールを無効化
+            on_scroll=self._handle_list_scroll,  # スクロールイベントハンドラを追加
         )
         
         # 検索フィールド
@@ -195,23 +206,51 @@ class JobMonitorApp:
                     on_click=lambda e, kw=keyword: self._add_keyword_chip(kw),
                     style=ft.ButtonStyle(
                         shape=ft.RoundedRectangleBorder(radius=20),
-                        padding=5
+                        padding=5,
+                        color=ft.colors.WHITE,
+                        bgcolor=[
+                            ft.colors.BLUE_400,
+                            ft.colors.INDIGO_400,
+                            ft.colors.PURPLE_400,
+                            ft.colors.DEEP_PURPLE_400,
+                            ft.colors.TEAL_400,
+                        ][i % 5],  # 5種類の色をローテーション
+                        elevation=2,
                     ),
                     height=35
-                ) for keyword in self.POPULAR_KEYWORDS[:5]  # 最初の5つだけ表示
+                ) for i, keyword in enumerate(self.POPULAR_KEYWORDS[:5])  # 最初の5つだけ表示
             ],
             wrap=True,
-            scroll="auto"
+            spacing=8,
         )
         
         # 検索ボタン
         self.search_button = ft.ElevatedButton(
-            text="検索",
-            on_click=self._handle_search_click,
+            "検索",
             icon=ft.icons.SEARCH,
             style=ft.ButtonStyle(
+                bgcolor=ft.colors.INDIGO_600,
+                color=ft.colors.WHITE,
                 shape=ft.RoundedRectangleBorder(radius=8),
+                elevation=3,
+                animation_duration=300,
             ),
+            on_click=self._handle_search_click,
+        )
+        
+        # 検索キャンセルボタン
+        self.search_cancel_button = ft.ElevatedButton(
+            "検索中断",
+            icon=ft.icons.CANCEL,
+            style=ft.ButtonStyle(
+                bgcolor=ft.colors.RED_600,
+                color=ft.colors.WHITE,
+                shape=ft.RoundedRectangleBorder(radius=8),
+                elevation=3,
+                animation_duration=300,
+            ),
+            on_click=self._handle_search_cancel,
+            visible=False,  # 初期状態では非表示
         )
         
         # フィルター関連のフィールド
@@ -249,7 +288,7 @@ class JobMonitorApp:
         self.notification_switch = ft.Switch(
             label="通知",
             value=True,
-            active_color=ft.colors.GREEN
+            active_color=ft.colors.TEAL_400
         )
         
         # 操作ボタン
@@ -259,6 +298,11 @@ class JobMonitorApp:
             on_click=self._handle_refresh_click,
             style=ft.ButtonStyle(
                 shape=ft.RoundedRectangleBorder(radius=8),
+                color=ft.colors.WHITE,
+                bgcolor=ft.colors.DEEP_PURPLE_500,
+                elevation=5,
+                shadow_color=ft.colors.DEEP_PURPLE_900,
+                animation_duration=300,  # アニメーション時間（ミリ秒）
             ),
         )
         
@@ -268,8 +312,12 @@ class JobMonitorApp:
             on_click=self._handle_start_click,
             style=ft.ButtonStyle(
                 shape=ft.RoundedRectangleBorder(radius=8),
+                color=ft.colors.WHITE,
+                elevation=5,
+                shadow_color=ft.colors.TEAL_900,
+                animation_duration=300,  # アニメーション時間（ミリ秒）
             ),
-            bgcolor=ft.colors.GREEN
+            bgcolor=ft.colors.TEAL_600
         )
         
         self.stop_button = ft.ElevatedButton(
@@ -278,8 +326,12 @@ class JobMonitorApp:
             on_click=self._handle_stop_click,
             style=ft.ButtonStyle(
                 shape=ft.RoundedRectangleBorder(radius=8),
+                color=ft.colors.WHITE,
+                elevation=5,
+                shadow_color=ft.colors.RED_900,
+                animation_duration=300,  # アニメーション時間（ミリ秒）
             ),
-            bgcolor=ft.colors.RED_400,
+            bgcolor=ft.colors.RED_600,
             disabled=True
         )
         
@@ -378,19 +430,74 @@ class JobMonitorApp:
         self.email_save_button = ft.ElevatedButton(
             text="保存",
             on_click=self._save_email_settings,
-            disabled=not self.email_config.get("enabled", False)
+            disabled=not self.email_config.get("enabled", False),
+            style=ft.ButtonStyle(
+                shape=ft.RoundedRectangleBorder(radius=8),
+                color=ft.colors.WHITE,
+                bgcolor=ft.colors.BLUE_600,
+                elevation=3,
+                shadow_color=ft.colors.BLUE_900,
+                animation_duration=300,  # アニメーション時間（ミリ秒）
+            ),
         )
         
         self.email_test_button = ft.ElevatedButton(
             text="テスト送信",
             on_click=self._send_test_email,
-            disabled=not self.email_config.get("enabled", False)
+            disabled=not self.email_config.get("enabled", False),
+            style=ft.ButtonStyle(
+                shape=ft.RoundedRectangleBorder(radius=8),
+                color=ft.colors.WHITE,
+                bgcolor=ft.colors.AMBER_600,
+                elevation=3,
+                shadow_color=ft.colors.AMBER_900,
+                animation_duration=300,  # アニメーション時間（ミリ秒）
+            ),
         )
         
         # メール通知設定
         self.email_settings_view = ft.Container(
             visible=False,
             padding=20
+        )
+        
+        # 操作ボタンコンテナ
+        self.actions_container = ft.Container(
+            content=ft.Row(
+                [
+                    self.search_button,
+                    self.search_cancel_button,  # 検索キャンセルボタンを追加
+                    self.refresh_button,
+                    self.start_button,
+                    self.stop_button,
+                ],
+                spacing=10,
+            ),
+            margin=ft.margin.only(top=10, bottom=10),
+        )
+        
+        # 検索進捗表示用コンポーネント
+        self.progress_container = ft.Container(
+            content=ft.Row(
+                [
+                    ft.ProgressRing(
+                        width=20, 
+                        height=20, 
+                        stroke_width=2,
+                        color=ft.colors.INDIGO_400
+                    ),
+                    ft.Text(
+                        "検索中...", 
+                        size=14, 
+                        color=ft.colors.INDIGO_400,
+                        weight=ft.FontWeight.W_500
+                    )
+                ],
+                spacing=10,
+                alignment=ft.MainAxisAlignment.CENTER
+            ),
+            visible=False,
+            padding=ft.padding.symmetric(vertical=10)
         )
     
     def _add_keyword_chip(self, keyword: str):
@@ -672,8 +779,9 @@ class JobMonitorApp:
             self.page.add(
                 title,
                 filter_controls,
-                operation_controls,
+                self.actions_container,
                 operation_help,  # 操作説明を追加
+                self.progress_container,  # ローディングアニメーションを追加
                 ft.Divider(),
                 ft.Container(
                     content=tabs,
@@ -728,13 +836,17 @@ class JobMonitorApp:
         
         logger.info(f"検索条件を更新: キーワード={self.filter_keywords}, 日数={self.filter_days}, 料金範囲={self.min_price}〜{self.max_price}")
         
-        # ボタンを無効化して重複クリックを防止
-        self.search_button.disabled = True
+        # 中断フラグをリセット
+        self.is_search_cancelled = False
+        
+        # ボタンの表示状態を更新
+        self.search_button.visible = False
+        self.search_cancel_button.visible = True
         self.refresh_button.disabled = True
         self.start_button.disabled = True
         
         # 進捗表示
-        self.progress_bar.visible = True
+        self.progress_container.visible = True
         self._update_status("クラウドワークスから最新データを取得中...", ft.colors.ORANGE)
         self.page.update()
         
@@ -742,63 +854,89 @@ class JobMonitorApp:
         threading.Thread(target=self._fetch_search_jobs).start()
     
     def _fetch_search_jobs(self):
-        """
-        検索ボタンから呼び出される仕事情報取得処理
-        
-        クラウドワークスから直接最新の仕事情報を取得し、フィルタリングして表示します。
-        jobs_data.jsonからの読み込みは行わず、毎回最新データを使用します。
-        """
+        """クラウドワークスから検索条件に合致する案件を取得"""
         try:
-            logger.info("検索: 仕事情報の取得を開始")
-            
-            # 進捗状態の更新
-            def update_progress(message):
-                def update():
-                    self.status_text.value = message
-                    self.page.update()
-                self._queue_ui_update(update)
-            
-            update_progress("クラウドワークスに接続中...")
-            
-            # 仕事情報の取得 (jobs_data.jsonを使わず直接取得)
-            jobs = self.scraper.get_job_offers()
-            logger.info(f"検索: {len(jobs)}件の仕事情報を取得")
-            
-            update_progress("データをフィルタリング中...")
-            
-            # UIを更新する関数
-            def update_search_result():
-                # プログレスインジケーターを非表示に
-                self.progress_bar.visible = False
-                
-                # ボタンを再度有効化
-                self.search_button.disabled = False
-                self.refresh_button.disabled = False 
-                self.start_button.disabled = False
-                
-                # 結果メッセージを表示
-                self._update_status(f"検索完了: {len(jobs)}件の案件を取得", ft.colors.GREEN)
-                
-                # 取得した仕事情報をフィルタリングして表示
-                self._display_search_jobs(jobs)
-                
+            # エラー発生時の処理を先に定義
+            def update_error():
+                self.progress_container.visible = False
+                self._update_status("検索中にエラーが発生しました", ft.colors.RED)
+                self._reset_search_buttons()
                 self.page.update()
             
-            # UI更新をキューに入れる
+            def update_progress(message):
+                def update():
+                    if not self.is_search_cancelled:  # 中断されていない場合のみ更新
+                        self.status_text.value = message  # progress_text → status_textに修正
+                        self.page.update()
+                self._queue_ui_update(update)
+            
+            update_progress("検索処理を開始しています...")
+            
+            # 中断されていないか確認
+            if self.is_search_cancelled:
+                logger.info("検索処理が中断されました")
+                self._reset_search_buttons()
+                return
+
+            # 中断されていないか確認
+            if self.is_search_cancelled:
+                logger.info("検索処理が中断されました")
+                self._reset_search_buttons()
+                return
+                
+            update_progress("クラウドワークスに接続中...")
+            
+            # 中断チェックポイント
+            if self.is_search_cancelled:
+                logger.info("検索処理が中断されました")
+                self._reset_search_buttons()
+                return
+                
+            # キーワードフィルタリング
+            keyword_str = ",".join(self.filter_keywords) if self.filter_keywords else ""
+            
+            update_progress(f"キーワード '{keyword_str}' で検索中...")
+            
+            # 元のscraperを使用
+            jobs = self.scraper.get_job_offers()
+            
+            # 中断されていないか確認
+            if self.is_search_cancelled:
+                logger.info("検索処理が中断されました")
+                self._reset_search_buttons()
+                return
+            
+            def update_search_result():
+                # プログレスインジケーターを非表示に
+                self.progress_container.visible = False
+                
+                # 結果を表示
+                if not jobs:
+                    self._update_status("検索条件に合致する案件は見つかりませんでした", ft.colors.ORANGE)
+                else:
+                    self._display_search_jobs(jobs)
+                    self._update_status(f"{len(jobs)}件の案件が見つかりました", ft.colors.GREEN)
+                
+                # ボタンの状態を元に戻す
+                self._reset_search_buttons()
+                self.page.update()
+            
+            # 結果更新処理をキューに追加
             self._queue_ui_update(update_search_result)
             
         except Exception as e:
-            logger.error(f"検索用データ取得中にエラーが発生: {e}", exc_info=True)
-            
-            def update_error():
-                self.progress_bar.visible = False
-                self.search_button.disabled = False
-                self.refresh_button.disabled = False
-                self.start_button.disabled = False
-                self._update_status(f"エラー: {str(e)}", ft.colors.RED)
-                self.page.update()
-            
-            self._queue_ui_update(update_error)
+            logger.error(f"検索処理中にエラーが発生しました: {e}")
+            # ここでupdate_errorがスコープ内にあることを確認
+            try:
+                self._queue_ui_update(update_error)
+            except Exception as inner_e:
+                logger.error(f"エラー処理中に二次的なエラーが発生しました: {inner_e}")
+                def emergency_reset():
+                    self.progress_container.visible = False
+                    self._update_status("検索中に重大なエラーが発生しました", ft.colors.RED)
+                    self._reset_search_buttons()
+                    self.page.update()
+                self._queue_ui_update(emergency_reset)
     
     def _display_search_jobs(self, jobs: List[Dict[str, Any]]):
         """
@@ -1524,6 +1662,11 @@ class JobMonitorApp:
                 on_click=lambda e, url=job_url: self._open_url(url),
                 style=ft.ButtonStyle(
                     shape=ft.RoundedRectangleBorder(radius=8),
+                    color=ft.colors.WHITE,
+                    bgcolor=ft.colors.CYAN_700,
+                    elevation=2,
+                    shadow_color=ft.colors.CYAN_900,
+                    animation_duration=300,  # アニメーション時間（ミリ秒）
                 ),
             )
             
@@ -2121,10 +2264,67 @@ class JobMonitorApp:
         # メールアドレスが設定されていない場合は通知
         if not has_valid_email:
             self._update_status("メールアドレスを設定してから操作を行ってください", ft.colors.AMBER)
+    
+    def _handle_search_cancel(self, e):
+        """検索中断ボタンがクリックされたときの処理"""
+        logger.info("検索処理が中断されました")
+        self.is_search_cancelled = True
+        self._update_status("検索が中断されました", ft.colors.RED)
+        
+        # ボタンの状態を元に戻す
+        self._reset_search_buttons()
+        self.page.update()
+    
+    def _reset_search_buttons(self):
+        """検索関連ボタンの状態をリセット"""
+        self.search_button.visible = True
+        self.search_button.disabled = False
+        self.search_cancel_button.visible = False
+        self.refresh_button.disabled = False
+        self.start_button.disabled = False
+        self.progress_container.visible = False
+        self.page.update()  # 状態変更を即時反映
+    
+    def _handle_list_scroll(self, e):
+        """リストのスクロールイベントを処理"""
+        # スクロール位置が極端な場合に調整
+        if hasattr(e, 'pixels') and hasattr(e.control, 'scroll_to'):
+            # スクロール位置が極端な場合、安全な位置に調整
+            if e.pixels > 10000:  # かなり下にスクロールした場合
+                e.control.scroll_to(offset=8000)
+                self.page.update()
 
 def main(page: ft.Page):
     """アプリケーションのエントリーポイント"""
     try:
+        # アプリのタイトル設定
+        page.title = "クラウドワークス新着案件モニター"
+        
+        # テーマ設定
+        page.theme = ft.Theme(
+            color_scheme_seed=ft.colors.INDIGO,
+            visual_density=ft.VisualDensity.COMFORTABLE,  # ThemeVisualDensityからVisualDensityに変更
+        )
+        
+        # ダークモード設定
+        page.theme_mode = ft.ThemeMode.LIGHT
+        
+        # フォント設定
+        page.fonts = {
+            "ja": "Noto Sans JP",
+            "en": "Roboto",
+        }
+        
+        # 背景色設定
+        page.bgcolor = ft.colors.INDIGO_50
+        
+        # 余白設定
+        page.padding = 15
+        
+        # スクロール設定
+        page.scroll = ft.ScrollMode.AUTO
+        
+        # アプリのインスタンス作成
         app = JobMonitorApp(page)
     except Exception as e:
         logger.error(f"アプリケーションの初期化に失敗しました: {e}")

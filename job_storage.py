@@ -42,19 +42,37 @@ class JobStorage:
     
     def load_jobs(self) -> None:
         """保存されている仕事情報を読み込む"""
-        if os.path.exists(self.storage_file):
+        if os.path.exists(self.storage_file) and os.path.getsize(self.storage_file) > 0:
             try:
                 with open(self.storage_file, 'r', encoding='utf-8') as f:
                     jobs_list = json.load(f)
                     # リストを辞書に変換（IDをキーにする）
                     self.jobs = {str(job['id']): job for job in jobs_list}
                 logger.info(f"{len(self.jobs)}件の仕事情報を読み込みました")
-            except (json.JSONDecodeError, KeyError) as e:
+            except json.JSONDecodeError as e:
                 logger.error(f"仕事情報の読み込みに失敗しました: {e}")
+                # 破損したファイルをバックアップ
+                backup_file = f"{self.storage_file}.bak.{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                try:
+                    os.rename(self.storage_file, backup_file)
+                    logger.info(f"破損したファイルを{backup_file}にバックアップしました")
+                except Exception as rename_error:
+                    logger.error(f"ファイルのバックアップに失敗しました: {rename_error}")
+                
+                # 新しい空のファイルを作成
+                self.jobs = {}
+                self.save_jobs()
+            except KeyError as e:
+                logger.error(f"仕事情報の形式が不正です: {e}")
+                self.jobs = {}
+            except Exception as e:
+                logger.error(f"仕事情報の読み込み中に予期しないエラーが発生しました: {e}")
                 self.jobs = {}
         else:
             logger.info("仕事情報のファイルが見つかりません。新規作成します。")
             self.jobs = {}
+            # 空のファイルを作成
+            self.save_jobs()
     
     def save_jobs(self) -> None:
         """仕事情報をファイルに保存する"""
