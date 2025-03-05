@@ -38,7 +38,8 @@ from job_storage import JobStorage
 # 新しく作成したモジュールをインポート
 from job_utils import (
     parse_date, format_date, get_job_date_for_sorting,
-    is_within_days, get_job_price, price_in_range, format_payment_text
+    is_within_days, get_job_price, price_in_range, format_payment_text,
+    extract_price_from_text
 )
 from ui_components import (
     create_job_card, show_notification, update_status, create_settings_tab
@@ -71,17 +72,22 @@ class JobMonitorApp:
     
     def __init__(self, page: ft.Page):
         """
-        クラウドワークス案件モニターアプリケーションの初期化
+        アプリケーションの初期化
         
         Args:
             page: Fletのページオブジェクト
         """
-        # 処理開始メッセージ
-        logger.info("アプリケーションの初期化を開始")
-        
         try:
             # ページオブジェクトの設定
             self.page = page
+            self.page.title = "クラウドワークス案件モニター"
+            self.page.window_width = 1200
+            self.page.window_height = 800
+            self.page.theme_mode = ft.ThemeMode.SYSTEM
+            
+            # ロガーの設定
+            self.logger = logging.getLogger(__name__)
+            self.logger.info("アプリケーションの初期化を開始")
             
             # スクレイパーとストレージの初期化
             self.scraper = CrowdworksJobScraper()
@@ -108,6 +114,7 @@ class JobMonitorApp:
             
             # メール通知設定
             self.email_config = self._load_email_config()
+            self.logger.info("メール設定を読み込みました")
             
             # UIコンポーネント
             self._init_ui_components()
@@ -118,10 +125,10 @@ class JobMonitorApp:
             # UI更新タイマー設定
             self._setup_ui_update_timer()
             
-            logger.info("アプリケーションの初期化が完了しました")
+            self.logger.info("アプリケーションの初期化が完了しました")
             
         except Exception as e:
-            logger.error(f"アプリケーションの初期化中にエラーが発生しました: {e}", exc_info=True)
+            self.logger.error(f"アプリケーションの初期化中にエラーが発生しました: {e}", exc_info=True)
             raise
     
     def _load_email_config(self) -> Dict[str, Any]:
@@ -326,13 +333,15 @@ class JobMonitorApp:
             label="最低報酬（円）",
             hint_text="例: 5000",
             width=150,
+            tooltip="この金額以上の案件を表示",
             input_filter=ft.NumbersOnlyInputFilter()
         )
         
         self.max_price_field = ft.TextField(
             label="最高報酬（円）",
-            hint_text="上限なし",
+            hint_text="例: 50000",
             width=150,
+            tooltip="この金額以下の案件を表示（空欄は上限なし）",
             input_filter=ft.NumbersOnlyInputFilter()
         )
         
@@ -647,7 +656,7 @@ class JobMonitorApp:
                     'category_id': 17,
                     'expired_on': '2025-04-01',
                     'last_released_at': '2025-03-05T12:00:00+09:00',
-                    'payment_info': '50000.0円 〜 100000.0円',
+                    'payment_info': '50000円 〜 100000円',
                     'client_name': 'テスト依頼者',
                     'is_employer_certification': True
                 },
@@ -659,7 +668,7 @@ class JobMonitorApp:
                     'category_id': 40,
                     'expired_on': '2025-04-15',
                     'last_released_at': '2025-03-06T15:30:00+09:00',
-                    'payment_info': '100000.0円 〜 200000.0円',
+                    'payment_info': '100000円 〜 200000円',
                     'client_name': 'データサイエンス企業',
                     'is_employer_certification': False
                 },
@@ -671,9 +680,45 @@ class JobMonitorApp:
                     'category_id': 14,
                     'expired_on': '2025-04-10',
                     'last_released_at': '2025-03-07T09:15:00+09:00',
-                    'payment_info': '30000.0円 〜 80000.0円',
+                    'payment_info': '30000円 〜 80000円',
                     'client_name': 'システム開発会社',
                     'is_employer_certification': True
+                },
+                {
+                    'id': 98765,
+                    'title': '【初心者歓迎】データ入力アシスタント募集',
+                    'url': 'https://crowdworks.jp/public/jobs/98765',
+                    'description': 'データ入力のお仕事です。特別なスキルは必要ありません。時間に余裕のある方、副業で収入を得たい方におすすめです。',
+                    'category_id': 22,
+                    'expired_on': '2025-04-05',
+                    'last_released_at': '2025-03-08T10:45:00+09:00',
+                    'payment_info': '時給 1500円 〜 2000円',
+                    'client_name': 'オフィスサポート会社',
+                    'is_employer_certification': False
+                },
+                {
+                    'id': 24680,
+                    'title': '【高単価】AIエンジニア募集',
+                    'url': 'https://crowdworks.jp/public/jobs/24680',
+                    'description': 'AI開発プロジェクトに参加していただけるエンジニアを募集します。機械学習、深層学習の知識が必要です。',
+                    'category_id': 18,
+                    'expired_on': '2025-04-20',
+                    'last_released_at': '2025-03-09T14:20:00+09:00',
+                    'payment_info': '300000円 〜 500000円',
+                    'client_name': 'AIテクノロジー株式会社',
+                    'is_employer_certification': True
+                },
+                {
+                    'id': 13579,
+                    'title': '記事執筆ライター募集【1記事3000円】',
+                    'url': 'https://crowdworks.jp/public/jobs/13579',
+                    'description': 'さまざまなテーマの記事を執筆していただけるライターを募集します。文章力のある方、SEOに関する知識がある方歓迎。',
+                    'category_id': 36,
+                    'expired_on': '2025-04-08',
+                    'last_released_at': '2025-03-10T08:30:00+09:00',
+                    'payment_info': '記事単価 3000円 (2000〜2500文字)',
+                    'client_name': 'コンテンツ制作会社',
+                    'is_employer_certification': False
                 }
             ]
             # サンプルデータを保存
@@ -1126,71 +1171,61 @@ class JobMonitorApp:
     
     def _get_job_price(self, job: Dict[str, Any]) -> int:
         """
-        仕事の料金を取得
+        仕事の料金を取得するメソッド
         
         Args:
             job: 仕事情報の辞書
             
         Returns:
-            料金（整数）。料金が特定できない場合は-1を返す
+            抽出した金額（整数）。抽出できない場合は-1を返す
         """
         try:
+            # 仕事情報から支払い情報を取得
             payment_info = job.get('payment_info', '')
             
-            # 文字列の場合（新しいスクレイパー形式）
-            if isinstance(payment_info, str):
-                # 数字だけを抽出して返す
-                import re
-                
-                # 「〜」記号で分割して最初の数値を取得（最低額）
-                parts = payment_info.split('〜')
-                if len(parts) > 1:
-                    # 「5,000円 〜 10,000円」 形式の場合、最初の部分から数値を抽出
-                    numbers = re.findall(r'(\d[\d,]*)', parts[0])
-                    if numbers:
-                        # カンマを除去して整数に変換
-                        return int(numbers[0].replace(',', ''))
-                        
-                # 「〜 5,000円」 形式の場合は2つ目の部分から数値を抽出
-                if payment_info.startswith('〜'):
-                    numbers = re.findall(r'(\d[\d,]*)', payment_info)
-                    if numbers:
-                        return int(numbers[0].replace(',', ''))
-                
-                # 上記でないなら単純に数値を抽出
-                numbers = re.findall(r'(\d[\d,]*)', payment_info)
-                if numbers:
-                    # 最初の数値を返す（カンマを除去）
-                    return int(numbers[0].replace(',', ''))
-                    
-                # 数値がない場合
-                logger.warning(f"料金情報から数値を抽出できませんでした: {payment_info}")
+            # 空の場合は-1を返す
+            if not payment_info:
+                self.logger.warning(f"支払い情報が空です: job_id={job.get('id', 'unknown')}")
                 return -1
-            
-            # 辞書形式の場合（古い形式）
+                
+            # 文字列の場合は直接抽出
+            if isinstance(payment_info, str):
+                self.logger.debug(f"文字列から金額を抽出: {payment_info}")
+                return extract_price_from_text(payment_info)
+                
+            # 辞書形式の場合（旧形式との互換性のため）
             if isinstance(payment_info, dict):
-                payment_type = payment_info.get('type', '')
+                self.logger.debug(f"辞書から金額を抽出: {payment_info}")
+                
+                # 支払い形式によって処理を分ける
+                payment_type = payment_info.get('payment_type')
                 
                 if payment_type == 'fixed_price':
-                    return payment_info.get('price', 0)
-                elif payment_type == 'hourly':
-                    # 時給の場合は最低額を返す
-                    return payment_info.get('min_price', 0)
-                elif payment_type == 'writing_payment':
-                    # 執筆単価の場合、単価を返す
-                    return payment_info.get('price', 0)
+                    # 固定報酬
+                    price = payment_info.get('price', -1)
+                    return int(price) if price else -1
                     
-                logger.warning(f"未知の料金タイプ: {payment_type}")
-                return -1
+                elif payment_type == 'hourly_wage':
+                    # 時給
+                    min_price = payment_info.get('min_price', -1)
+                    return int(min_price) if min_price else -1
+                    
+                elif payment_type == 'writing_payment':
+                    # 記事単価
+                    min_price = payment_info.get('min_price', -1)
+                    return int(min_price) if min_price else -1
+                    
+                else:
+                    self.logger.warning(f"不明な支払い形式: {payment_type}, job_id={job.get('id', 'unknown')}")
+                    return -1
             
-            # payment_infoが不正な形式の場合
-            logger.warning(f"支払い情報の形式が不正: {type(payment_info)}, job_id: {job.get('id', 'unknown')}")
+            # その他の形式の場合
+            self.logger.warning(f"不明な支払い情報形式: {type(payment_info)}, job_id={job.get('id', 'unknown')}")
             return -1
-            
+        
         except Exception as e:
-            logger.error(f"料金の取得に失敗しました: {e}, job_id: {job.get('id', 'unknown')}")
-            logger.error(f"支払い情報の整形中にエラーが発生しました: {e}, job_id: {job.get('id', 'unknown')}")
-            return "報酬情報の取得に失敗"
+            self.logger.error(f"金額抽出中にエラーが発生: {e}, job_id={job.get('id', 'unknown')}")
+            return -1
     
     def _format_date(self, date_str: str) -> str:
         """日付文字列を整形"""
@@ -2028,7 +2063,7 @@ class JobMonitorApp:
             
             # 中断されていないか確認
             if self.is_search_cancelled:
-                logger.info("検索処理が中断されました")
+                self.logger.info("検索処理が中断されました")
                 self._reset_search_buttons()
                 return
                 
@@ -2043,12 +2078,12 @@ class JobMonitorApp:
             
             if is_simulation:
                 # シミュレーションモードの場合はサンプルデータを使用
-                logger.info("シミュレーションモードで実行中")
+                self.logger.info("シミュレーションモードで実行中")
                 jobs = self.storage.get_all_jobs()
                 
                 # サンプルデータがない場合はデモデータを作成
                 if not jobs:
-                    logger.info("サンプルデータが見つからないため、デモデータを作成します")
+                    self.logger.info("サンプルデータが見つからないため、デモデータを作成します")
                     jobs = [
                         {
                             'id': 12345,
@@ -2058,7 +2093,7 @@ class JobMonitorApp:
                             'category_id': 17,
                             'expired_on': '2025-04-01',
                             'last_released_at': '2025-03-05T12:00:00+09:00',
-                            'payment_info': '50000.0円 〜 100000.0円',
+                            'payment_info': '50000円 〜 100000円',
                             'client_name': 'テスト依頼者',
                             'is_employer_certification': True
                         },
@@ -2070,7 +2105,7 @@ class JobMonitorApp:
                             'category_id': 40,
                             'expired_on': '2025-04-15',
                             'last_released_at': '2025-03-06T15:30:00+09:00',
-                            'payment_info': '100000.0円 〜 200000.0円',
+                            'payment_info': '100000円 〜 200000円',
                             'client_name': 'データサイエンス企業',
                             'is_employer_certification': False
                         },
@@ -2082,9 +2117,45 @@ class JobMonitorApp:
                             'category_id': 14,
                             'expired_on': '2025-04-10',
                             'last_released_at': '2025-03-07T09:15:00+09:00',
-                            'payment_info': '30000.0円 〜 80000.0円',
+                            'payment_info': '30000円 〜 80000円',
                             'client_name': 'システム開発会社',
                             'is_employer_certification': True
+                        },
+                        {
+                            'id': 98765,
+                            'title': '【初心者歓迎】データ入力アシスタント募集',
+                            'url': 'https://crowdworks.jp/public/jobs/98765',
+                            'description': 'データ入力のお仕事です。特別なスキルは必要ありません。時間に余裕のある方、副業で収入を得たい方におすすめです。',
+                            'category_id': 22,
+                            'expired_on': '2025-04-05',
+                            'last_released_at': '2025-03-08T10:45:00+09:00',
+                            'payment_info': '時給 1500円 〜 2000円',
+                            'client_name': 'オフィスサポート会社',
+                            'is_employer_certification': False
+                        },
+                        {
+                            'id': 24680,
+                            'title': '【高単価】AIエンジニア募集',
+                            'url': 'https://crowdworks.jp/public/jobs/24680',
+                            'description': 'AI開発プロジェクトに参加していただけるエンジニアを募集します。機械学習、深層学習の知識が必要です。',
+                            'category_id': 18,
+                            'expired_on': '2025-04-20',
+                            'last_released_at': '2025-03-09T14:20:00+09:00',
+                            'payment_info': '300000円 〜 500000円',
+                            'client_name': 'AIテクノロジー株式会社',
+                            'is_employer_certification': True
+                        },
+                        {
+                            'id': 13579,
+                            'title': '記事執筆ライター募集【1記事3000円】',
+                            'url': 'https://crowdworks.jp/public/jobs/13579',
+                            'description': 'さまざまなテーマの記事を執筆していただけるライターを募集します。文章力のある方、SEOに関する知識がある方歓迎。',
+                            'category_id': 36,
+                            'expired_on': '2025-04-08',
+                            'last_released_at': '2025-03-10T08:30:00+09:00',
+                            'payment_info': '記事単価 3000円 (2000〜2500文字)',
+                            'client_name': 'コンテンツ制作会社',
+                            'is_employer_certification': False
                         }
                     ]
             else:
@@ -2092,11 +2163,11 @@ class JobMonitorApp:
                 jobs = self.scraper.get_job_offers()
             
             # ログに取得した仕事数を出力
-            logger.info(f"クラウドワークスから取得した仕事数: {len(jobs)}件")
+            self.logger.info(f"クラウドワークスから取得した仕事数: {len(jobs)}件")
             
             # 中断されていないか確認
             if self.is_search_cancelled:
-                logger.info("検索処理が中断されました")
+                self.logger.info("検索処理が中断されました")
                 self._reset_search_buttons()
                 return
             
@@ -2104,11 +2175,78 @@ class JobMonitorApp:
             if self.filter_keywords:
                 try:
                     filtered_jobs = self.scraper.search_jobs_by_keyword(jobs, self.filter_keywords)
-                    logger.info(f"キーワードフィルタリング後の仕事数: {len(filtered_jobs)}件")
+                    self.logger.info(f"キーワードフィルタリング後の仕事数: {len(filtered_jobs)}件")
                     jobs = filtered_jobs
                 except Exception as e:
-                    logger.error(f"キーワードフィルタリング中にエラーが発生しました: {e}")
+                    self.logger.error(f"キーワードフィルタリング中にエラーが発生しました: {e}")
                     update_progress("キーワードフィルタリング中にエラーが発生しました")
+                    # エラーが発生しても元のjobsを使用してそのまま処理を続行
+            
+            # 料金範囲によるフィルタリングを適用
+            if self.min_price > 0 or self.max_price > 0:
+                try:
+                    # デバッグ用：最初の5件の案件の価格情報を出力
+                    debug_count = min(5, len(jobs))
+                    if debug_count > 0:
+                        self.logger.info("価格フィルタリング前の案件サンプル:")
+                        for i in range(debug_count):
+                            job = jobs[i]
+                            price = self._get_job_price(job)
+                            self.logger.info(f"  - ID: {job.get('id')}, タイトル: {job.get('title', '')[:30]}..., payment_info: '{job.get('payment_info', '')}', 抽出価格: {price}円")
+                    
+                    price_filtered = []
+                    skipped_invalid_price = 0
+                    skipped_low_price = 0
+                    skipped_high_price = 0
+                    
+                    for job in jobs:
+                        price = self._get_job_price(job)
+                        
+                        # 異常な価格値のチェック（1円未満や1億円以上は無効と判断）
+                        if price < 1 or price > 100000000:
+                            skipped_invalid_price += 1
+                            continue
+                            
+                        # 最低金額のみ指定されている場合
+                        if self.min_price > 0 and self.max_price <= 0:
+                            if price >= self.min_price:
+                                price_filtered.append(job)
+                            else:
+                                skipped_low_price += 1
+                                
+                        # 最高金額のみ指定されている場合
+                        elif self.min_price <= 0 and self.max_price > 0:
+                            if price <= self.max_price:
+                                price_filtered.append(job)
+                            else:
+                                skipped_high_price += 1
+                                
+                        # 両方指定されている場合
+                        elif self.min_price <= price <= self.max_price:
+                            price_filtered.append(job)
+                        else:
+                            if price < self.min_price:
+                                skipped_low_price += 1
+                            else:
+                                skipped_high_price += 1
+                    
+                    # 詳細なフィルタリング結果のログ出力
+                    self.logger.info(f"料金フィルタリング結果: 合計{len(price_filtered)}件が条件に一致 (範囲: {self.min_price}〜{self.max_price}円)")
+                    self.logger.info(f"  - スキップされた件数: 無効な価格={skipped_invalid_price}件, 最低金額未満={skipped_low_price}件, 最高金額超過={skipped_high_price}件")
+                    
+                    # フィルタリング後の代表的な案件を出力
+                    if len(price_filtered) > 0:
+                        debug_count = min(3, len(price_filtered))
+                        self.logger.info("料金フィルタリング後の案件サンプル:")
+                        for i in range(debug_count):
+                            job = price_filtered[i]
+                            price = self._get_job_price(job)
+                            self.logger.info(f"  - ID: {job.get('id')}, タイトル: {job.get('title', '')[:30]}..., 価格: {price}円")
+                    
+                    jobs = price_filtered
+                except Exception as e:
+                    self.logger.error(f"料金フィルタリング中にエラーが発生しました: {e}")
+                    update_progress("料金フィルタリング中にエラーが発生しました")
                     # エラーが発生しても元のjobsを使用してそのまま処理を続行
             
             # 結果が0件の場合にユーザーに通知
@@ -2137,7 +2275,7 @@ class JobMonitorApp:
                 return
             
             # 事前にカードリストを作成して一度にUIを更新
-            logger.info(f"jobs_data.jsonから{len(storage_jobs)}件の仕事情報を読み込みました")
+            self.logger.info(f"jobs_data.jsonから{len(storage_jobs)}件の仕事情報を読み込みました")
             job_cards = []
             
             # 各案件の情報をカードに変換
@@ -2154,10 +2292,10 @@ class JobMonitorApp:
             self._reset_search_buttons()
             self.page.update()
             
-            logger.info("jobs_data.jsonからの案件表示処理が完了しました")
+            self.logger.info("jobs_data.jsonからの案件表示処理が完了しました")
             
         except Exception as e:
-            logger.error(f"検索処理中にエラーが発生しました: {e}", exc_info=True)
+            self.logger.error(f"検索処理中にエラーが発生しました: {e}", exc_info=True)
             try:
                 # エラー時には直接UI更新
                 self.progress_container.visible = False
@@ -2165,7 +2303,7 @@ class JobMonitorApp:
                 self._reset_search_buttons()
                 self.page.update()
             except Exception as inner_e:
-                logger.error(f"エラー処理中に二次的なエラーが発生しました: {inner_e}", exc_info=True)
+                self.logger.error(f"エラー処理中に二次的なエラーが発生しました: {inner_e}", exc_info=True)
     
     def _show_json_button_click(self, e):
         """
@@ -2192,7 +2330,7 @@ class JobMonitorApp:
                 self._show_notification("仕事情報がありません。検索を実行してデータを取得してください。", ft.colors.AMBER)
                 return
             
-            logger.info(f"jobs_data.jsonから{len(storage_jobs)}件の仕事情報を読み込みました")
+            self.logger.info(f"jobs_data.jsonから{len(storage_jobs)}件の仕事情報を読み込みました")
             
             # 事前にカードリストを作成して一度にUIを更新
             job_cards = []
@@ -2210,10 +2348,10 @@ class JobMonitorApp:
             
             # 完了通知
             self._show_notification(f"jobs_data.jsonから{len(storage_jobs)}件の案件を表示更新しました", ft.colors.GREEN)
-            logger.info("jobs_data.jsonからの案件表示処理が完了しました")
+            self.logger.info("jobs_data.jsonからの案件表示処理が完了しました")
             
         except Exception as e:
-            logger.error(f"JSONデータ表示中にエラーが発生しました: {e}")
+            self.logger.error(f"JSONデータ表示中にエラーが発生しました: {e}")
             self._show_notification(f"JSONデータを表示できませんでした: {str(e)}", ft.colors.RED)
     
     def _open_json_file(self, e):
@@ -2242,7 +2380,7 @@ class JobMonitorApp:
             self._show_notification(f"jobs_data.jsonファイルを開きました", ft.colors.GREEN)
             
         except Exception as e:
-            logger.error(f"ファイルを開く際にエラーが発生しました: {e}")
+            self.logger.error(f"ファイルを開く際にエラーが発生しました: {e}")
             self._show_notification(f"ファイルを開けませんでした: {str(e)}", ft.colors.RED)
     
     def _show_json_data(self, jobs: List[Dict[str, Any]]):
@@ -2313,10 +2451,10 @@ class JobMonitorApp:
             self.page.update()
             
             # ログにも記録
-            logger.info(f"jobs_data.jsonの内容を表示しました（{len(jobs)}件の仕事情報）")
+            self.logger.info(f"jobs_data.jsonの内容を表示しました（{len(jobs)}件の仕事情報）")
             
         except Exception as e:
-            logger.error(f"jobs_data.jsonの内容を表示する際にエラーが発生しました: {e}")
+            self.logger.error(f"jobs_data.jsonの内容を表示する際にエラーが発生しました: {e}")
             self._show_notification(f"jobs_data.jsonの内容を表示できませんでした: {str(e)}", ft.colors.RED)
     
     def _close_json_dialog(self, e):
