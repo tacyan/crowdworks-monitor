@@ -555,8 +555,9 @@ class JobMonitorApp:
                     self.stop_button,
                     # JSONデータ表示ボタンを追加
                     ft.ElevatedButton(
-                        text="JSON形式表示",
+                        text="JSON更新表示",
                         icon=ft.icons.DATA_OBJECT,
+                        tooltip="jobs_data.jsonの最新データを表示します",
                         on_click=self._show_json_button_click,
                         style=ft.ButtonStyle(
                             shape=ft.RoundedRectangleBorder(radius=8),
@@ -1690,36 +1691,41 @@ class JobMonitorApp:
         
         Args:
             jobs: クラウドワークスから直接取得した仕事情報
-            show_json_data: 取得した仕事情報をJSON形式で表示するかどうか
+            show_json_data: 取得した仕事情報をJSON形式で表示するかどうか（デフォルトでTrue）
         """
         try:
             # 処理開始のログ
             logger.info("検索結果表示処理を開始")
             
-            # show_json_dataフラグが有効の場合、jobs_data.jsonから直接データを読み込んで表示
-            if show_json_data:
-                logger.info("jobs_data.jsonから直接データを読み込みます")
-                storage_jobs = self.storage.get_all_jobs()
-                if storage_jobs:
-                    logger.info(f"jobs_data.jsonから{len(storage_jobs)}件の仕事情報を読み込みました")
-                    
-                    # 表示の更新
-                    self.job_list.controls = []
-                    
-                    # 各案件の情報を表示
-                    for job in storage_jobs:
-                        self.job_list.controls.append(self._create_json_card(job))
-                    
-                    # 完了ステータスの更新
-                    update_status(self.status_text, f"jobs_data.jsonから{len(storage_jobs)}件の案件を表示中", ft.colors.GREEN, self.page)
-                    self.page.update()
-                    logger.info("jobs_data.jsonからの案件表示処理が完了しました")
-                    return
-                else:
-                    logger.warning("jobs_data.jsonにデータがありません")
-                    self._show_notification("jobs_data.jsonにデータがありません", ft.colors.AMBER)
+            # 常にjobs_data.jsonから直接データを読み込んで表示する
+            logger.info("jobs_data.jsonから直接データを読み込みます")
+            storage_jobs = self.storage.get_all_jobs()
+            if storage_jobs:
+                logger.info(f"jobs_data.jsonから{len(storage_jobs)}件の仕事情報を読み込みました")
+                
+                # 表示の更新（最適化：事前にコントロールのリストを作成）
+                self.job_list.controls = []
+                job_cards = []
+                
+                # 各案件の情報をカードに変換
+                for job in storage_jobs:
+                    job_cards.append(self._create_json_card(job))
+                
+                # 一度に追加して更新回数を減らす
+                self.job_list.controls = job_cards
+                
+                # 完了ステータスの更新
+                update_status(self.status_text, f"jobs_data.jsonから{len(storage_jobs)}件の案件を表示中", ft.colors.GREEN, self.page)
+                self.page.update()
+                logger.info("jobs_data.jsonからの案件表示処理が完了しました")
+                return
+            else:
+                logger.warning("jobs_data.jsonにデータがありません")
+                self._show_notification("jobs_data.jsonにデータがありません", ft.colors.AMBER)
+                
+                # 以下のコードは実行されないが、jobs_data.jsonにデータがない場合のフォールバックとして残しておく
             
-            # 通常の検索処理
+            # 通常の検索処理（フォールバック用）
             logger.info(f"検索前の仕事数: {len(jobs)}件")
             
             # クラウドワークスから取得した件数を表示
@@ -1942,21 +1948,13 @@ class JobMonitorApp:
         threading.Thread(target=self._fetch_search_jobs).start()
     
     def _fetch_search_jobs(self):
-        """クラウドワークスから検索条件に合致する案件を取得"""
+        """クラウドワークスから検索条件に合致する案件を取得して表示"""
         try:
-            # エラー発生時の処理を先に定義
-            def update_error():
-                self.progress_container.visible = False
-                self._update_status("検索中にエラーが発生しました", ft.colors.RED)
-                self._reset_search_buttons()
-                self.page.update()
-            
+            # プログレス表示用の関数
             def update_progress(message):
-                def update():
-                    if not self.is_search_cancelled:  # 中断されていない場合のみ更新
-                        self.status_text.value = message
-                        self.page.update()
-                self._queue_ui_update(update)
+                if not self.is_search_cancelled:  # 中断されていない場合のみ更新
+                    self.status_text.value = message
+                    self.page.update()
             
             update_progress("検索処理を開始しています...")
             
@@ -1968,15 +1966,8 @@ class JobMonitorApp:
                 
             update_progress("クラウドワークスに接続中...")
             
-            # 中断チェックポイント
-            if self.is_search_cancelled:
-                logger.info("検索処理が中断されました")
-                self._reset_search_buttons()
-                return
-                
             # キーワードフィルタリング
             keyword_str = ",".join(self.filter_keywords) if self.filter_keywords else ""
-            
             update_progress(f"キーワード '{keyword_str}' で検索中...")
             
             # スクレイパーで仕事情報を取得
@@ -1985,57 +1976,66 @@ class JobMonitorApp:
             # ログに取得した仕事数を出力
             logger.info(f"クラウドワークスから取得した仕事数: {len(jobs)}件")
             
-            # 取得した仕事情報をJSON形式で保存する（検索のたびに更新）
-            self.storage.update_jobs(jobs)
-            
             # 中断されていないか確認
             if self.is_search_cancelled:
                 logger.info("検索処理が中断されました")
                 self._reset_search_buttons()
                 return
             
-            # 取得した仕事数が50件の場合、JSON表示を有効にする
-            show_json_data = len(jobs) == 50
+            # 取得した仕事情報をJSON形式で保存する（検索のたびに更新）
+            self.storage.update_jobs(jobs)
             
-            def update_search_result():
-                # プログレスインジケーターを非表示に
-                self.progress_container.visible = False
-                
-                # 結果を表示
-                if not jobs:
-                    self._update_status("検索条件に合致する案件は見つかりませんでした", ft.colors.ORANGE)
-                else:
-                    # 取得件数が50件の場合はJSON表示を有効にする
-                    self._display_search_jobs(jobs, show_json_data)
-                    if show_json_data:
-                        self._update_status(f"jobs_data.jsonから{len(jobs)}件の案件を表示しています", ft.colors.GREEN)
-                    else:
-                        self._update_status(f"{len(jobs)}件の案件が見つかりました", ft.colors.GREEN)
-                
-                # ボタンの状態を元に戻す
+            # jobs_data.jsonからデータを直接読み込む（保存直後）
+            storage_jobs = self.storage.get_all_jobs()
+            
+            # プログレスインジケーターを非表示に
+            self.progress_container.visible = False
+            
+            # 検索結果がない場合の処理
+            if not storage_jobs:
+                self._update_status("仕事情報がありません", ft.colors.ORANGE)
+                self._show_notification("jobs_data.jsonにデータがありません", ft.colors.AMBER)
                 self._reset_search_buttons()
-                self.page.update()
+                return
             
-            # 結果更新処理をキューに追加
-            self._queue_ui_update(update_search_result)
+            # 事前にカードリストを作成して一度にUIを更新
+            logger.info(f"jobs_data.jsonから{len(storage_jobs)}件の仕事情報を読み込みました")
+            job_cards = []
+            
+            # 各案件の情報をカードに変換
+            for job in storage_jobs:
+                job_cards.append(self._create_json_card(job))
+            
+            # 一度に追加して更新回数を減らす
+            self.job_list.controls = job_cards
+            
+            # ステータス更新
+            self._update_status(f"jobs_data.jsonから{len(storage_jobs)}件の案件を表示中", ft.colors.GREEN)
+            
+            # ボタンの状態を元に戻す
+            self._reset_search_buttons()
+            self.page.update()
+            
+            logger.info("jobs_data.jsonからの案件表示処理が完了しました")
             
         except Exception as e:
             logger.error(f"検索処理中にエラーが発生しました: {e}", exc_info=True)
-            # ここでupdate_errorがスコープ内にあることを確認
             try:
-                self._queue_ui_update(update_error)
+                # エラー時には直接UI更新
+                self.progress_container.visible = False
+                self._update_status("検索中にエラーが発生しました", ft.colors.RED)
+                self._reset_search_buttons()
+                self.page.update()
             except Exception as inner_e:
                 logger.error(f"エラー処理中に二次的なエラーが発生しました: {inner_e}", exc_info=True)
-                def emergency_reset():
-                    self.progress_container.visible = False
-                    self._update_status("検索中に重大なエラーが発生しました", ft.colors.RED)
-                    self._reset_search_buttons()
-                    self.page.update()
-                self._queue_ui_update(emergency_reset)
     
     def _show_json_button_click(self, e):
         """
-        JSON表示ボタンのクリックハンドラ
+        JSON更新表示ボタンのクリックハンドラ
+        
+        jobs_data.jsonファイルから最新のデータを読み込んで表示を更新します。
+        検索機能は既にJSON形式で表示されますが、このボタンはファイルの内容を
+        手動で再読み込みする場合に使用します。
         
         Args:
             e: イベントオブジェクト
@@ -2047,15 +2047,33 @@ class JobMonitorApp:
                 return
                 
             # ファイルから仕事情報を読み込む
-            jobs = self.storage.get_all_jobs()
+            storage_jobs = self.storage.get_all_jobs()
             
-            # jobs_data.jsonの内容を表示
-            if jobs:
-                # ダイアログではなく、案件一覧に直接表示
-                self._display_search_jobs(jobs, show_json_data=True)
-                self._show_notification(f"jobs_data.jsonから{len(jobs)}件の案件を表示しました", ft.colors.GREEN)
-            else:
+            # データがない場合
+            if not storage_jobs:
                 self._show_notification("仕事情報がありません。検索を実行してデータを取得してください。", ft.colors.AMBER)
+                return
+            
+            logger.info(f"jobs_data.jsonから{len(storage_jobs)}件の仕事情報を読み込みました")
+            
+            # 事前にカードリストを作成して一度にUIを更新
+            job_cards = []
+            
+            # 各案件の情報をカードに変換
+            for job in storage_jobs:
+                job_cards.append(self._create_json_card(job))
+            
+            # 一度に追加して更新回数を減らす
+            self.job_list.controls = job_cards
+            
+            # ステータス更新
+            self._update_status(f"jobs_data.jsonから{len(storage_jobs)}件の案件を表示中", ft.colors.GREEN)
+            self.page.update()
+            
+            # 完了通知
+            self._show_notification(f"jobs_data.jsonから{len(storage_jobs)}件の案件を表示更新しました", ft.colors.GREEN)
+            logger.info("jobs_data.jsonからの案件表示処理が完了しました")
+            
         except Exception as e:
             logger.error(f"JSONデータ表示中にエラーが発生しました: {e}")
             self._show_notification(f"JSONデータを表示できませんでした: {str(e)}", ft.colors.RED)
