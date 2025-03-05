@@ -19,6 +19,7 @@ import threading
 import webbrowser
 import smtplib
 import shutil
+import subprocess
 from queue import Queue
 from typing import List, Dict, Any, Optional, Callable
 from email.mime.text import MIMEText
@@ -34,6 +35,14 @@ from flet import (
 
 from job_scraper import CrowdworksJobScraper
 from job_storage import JobStorage
+# 新しく作成したモジュールをインポート
+from job_utils import (
+    parse_date, format_date, get_job_date_for_sorting,
+    is_within_days, get_job_price, price_in_range, format_payment_text
+)
+from ui_components import (
+    create_job_card, show_notification, update_status, create_settings_tab
+)
 
 # 日本のタイムゾーン
 JST = timezone(timedelta(hours=9))
@@ -165,6 +174,56 @@ class JobMonitorApp:
             logger.error(f"メール設定の読み込みに失敗しました: {e}")
             return default_config
     
+    def _load_email_settings(self) -> Dict[str, Any]:
+        """
+        メール設定を読み込む
+        
+        Returns:
+            メール設定の辞書
+        """
+        config_path = "email_config.json"
+        default_config = {
+            "enabled": False,
+            "gmail_address": "",
+            "gmail_app_password": "",
+            "recipient": "",
+            "simulation_mode": True,  # デフォルトでシミュレーションモード有効
+            "auto_fallback": True,    # デフォルトで自動フォールバック有効
+            "subject_template": "クラウドワークスで{count}件の新着案件があります"
+        }
+        
+        try:
+            if not os.path.exists(config_path) or os.path.getsize(config_path) == 0:
+                # ファイルが存在しないか空の場合、デフォルト設定を保存して返す
+                with open(config_path, 'w', encoding='utf-8') as f:
+                    json.dump(default_config, f, ensure_ascii=False, indent=2)
+                logger.info("デフォルトのメール設定ファイルを作成しました")
+                return default_config
+                
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+                logger.info("メール設定を読み込みました")
+                return config
+        except json.JSONDecodeError:
+            # JSON形式が不正な場合
+            logger.error("メール設定の読み込みに失敗しました: 不正なJSON形式です")
+            # バックアップを作成して新しいファイルを生成
+            if os.path.exists(config_path):
+                backup_path = f"{config_path}.bak"
+                try:
+                    shutil.copy(config_path, backup_path)
+                    logger.info(f"不正なメール設定ファイルを{backup_path}にバックアップしました")
+                except Exception as e:
+                    logger.error(f"バックアップの作成に失敗しました: {e}")
+            # デフォルト設定を保存
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(default_config, f, ensure_ascii=False, indent=2)
+            logger.info("デフォルトのメール設定ファイルを作成しました")
+            return default_config
+        except Exception as e:
+            logger.error(f"メール設定の読み込みに失敗しました: {e}")
+            return default_config
+    
     def _save_email_config(self):
         """メール設定を保存する"""
         try:
@@ -176,8 +235,16 @@ class JobMonitorApp:
     
     def _init_ui_components(self):
         """UIコンポーネントの初期化"""
-        # 検索中断フラグの初期化
+        logging.info("UIコンポーネントを初期化中...")
         self.is_search_cancelled = False
+        
+        # メール設定の読み込み
+        try:
+            self.email_config = self._load_email_settings()
+            logging.info(f"メール設定を読み込みました: {self.email_config}")
+        except Exception as e:
+            logging.error(f"メール設定の読み込みに失敗しました: {e}")
+            self.email_config = {"enabled": False}
         
         # ステータステキスト
         self.status_text = ft.Text("準備完了", color=ft.colors.GREEN)
@@ -409,6 +476,22 @@ class JobMonitorApp:
             on_change=self._toggle_email_settings
         )
         
+        # シミュレーションモードスイッチ
+        self.simulation_mode_switch = ft.Switch(
+            label="シミュレーションモード",
+            value=self.email_config.get("simulation_mode", True),
+            active_color=ft.colors.AMBER,
+            on_change=self._toggle_simulation_mode
+        )
+        
+        # 自動フォールバックスイッチ
+        self.auto_fallback_switch = ft.Switch(
+            label="自動フォールバック",
+            value=self.email_config.get("auto_fallback", True),
+            active_color=ft.colors.BLUE,
+            on_change=self._toggle_auto_fallback
+        )
+        
         # Gmail設定フィールド（送受信兼用）
         self.gmail_address_field = ft.TextField(
             label="Gmailアドレス（送受信兼用）",
@@ -470,6 +553,20 @@ class JobMonitorApp:
                     self.refresh_button,
                     self.start_button,
                     self.stop_button,
+                    # JSONデータ表示ボタンを追加
+                    ft.ElevatedButton(
+                        text="JSON表示",
+                        icon=ft.icons.DATA_OBJECT,
+                        on_click=self._show_json_button_click,
+                        style=ft.ButtonStyle(
+                            shape=ft.RoundedRectangleBorder(radius=8),
+                            color=ft.colors.WHITE,
+                            bgcolor=ft.colors.INDIGO_400,
+                            elevation=3,
+                            shadow_color=ft.colors.INDIGO_900,
+                            animation_duration=300,
+                        ),
+                    ),
                 ],
                 spacing=10,
             ),
@@ -499,6 +596,17 @@ class JobMonitorApp:
             visible=False,
             padding=ft.padding.symmetric(vertical=10)
         )
+        
+        # 操作説明
+        self.operation_help = ft.Container(
+            content=ft.Text(
+                "【ボタン説明】「開始」: 1時間ごとの自動更新を開始 / 「停止」: 自動更新を停止 / 「今すぐ更新」: 手動で更新",
+                size=12,
+                italic=True,
+                color=ft.colors.GREY
+            ),
+            margin=ft.margin.only(bottom=10)
+        )
     
     def _add_keyword_chip(self, keyword: str):
         """
@@ -518,239 +626,55 @@ class JobMonitorApp:
         
         self.page.update()
     
-    def _toggle_email_settings(self, e):
-        """メール設定の有効/無効を切り替え"""
-        enabled = self.email_enabled_switch.value
-        self.gmail_address_field.disabled = not enabled
-        self.gmail_app_password_field.disabled = not enabled
-        self.email_save_button.disabled = not enabled
-        self.email_test_button.disabled = not enabled
-        
-        # 設定変更時にボタンの状態も更新
-        self._update_operation_buttons_state()
-        
-        self.page.update()
-    
-    def _save_email_settings(self, e):
-        """
-        メール設定の保存
-        """
-        if self._validate_email_config():
-            self.email_config["enabled"] = True
-            self.email_config["gmail_address"] = self.gmail_address_field.value
-            self.email_config["recipient"] = self.gmail_address_field.value  # 送受信に同じアドレスを使用
-            self.email_config["gmail_app_password"] = self.gmail_app_password_field.value
-            
-            # シミュレーションモードを有効に
-            if "simulation_mode" not in self.email_config:
-                self.email_config["simulation_mode"] = True
-                self.simulation_mode_switch.value = True
-            
-            # 自動フォールバックを有効に
-            if "auto_fallback" not in self.email_config:
-                self.email_config["auto_fallback"] = True
-                self.auto_fallback_switch.value = True
-            
-            # 共通設定
-            self.email_config["subject_template"] = "クラウドワークスで{count}件の新着案件があります"
-            
-            self._save_email_config()
-            
-            if hasattr(self, "email_settings_view"):
-                self.email_settings_view.visible = False
-            
-            # シミュレーションモードが有効な場合はその旨を通知
-            if self.email_config.get("simulation_mode", True):
-                self._update_status(f"メール設定を保存しました（シミュレーションモード有効）", ft.colors.GREEN)
-                self._show_notification("シミュレーションモードが有効です。実際にメールは送信されません。", ft.colors.BLUE)
-            else:
-                self._update_status(f"メール設定を保存しました", ft.colors.GREEN)
-            
-            # ボタンの状態を更新
-            self._update_operation_buttons_state()
-            
-            # メール設定後に自動更新を開始するフラグがある場合
-            if hasattr(self, "_start_after_mail_setting") and self._start_after_mail_setting:
-                self._start_after_mail_setting = False
-                # 自動更新を開始
-                self._start_scheduler_ui_update()
-                threading.Thread(target=self._start_scheduler).start()
-            
-            self.page.update()
-        else:
-            self._update_status("メール設定を入力してください", ft.colors.RED)
-    
-    def _send_test_email(self, e):
-        """テストメールを送信"""
-        try:
-            if not self._validate_email_config():
-                return
-            
-            self._send_email_notification(
-                subject="クラウドワークス新着案件モニター - テストメール",
-                jobs=[],
-                is_test=True
-            )
-            
-            self._show_notification("テストメールを送信しました")
-        except Exception as e:
-            logger.error(f"テストメール送信に失敗しました: {e}")
-            self._show_notification(f"テストメール送信に失敗しました: {str(e)}")
-    
-    def _setup_ui_update_timer(self):
-        """UI更新タイマーの設定"""
-        def update_timer_callback(e):
-            self._process_ui_updates()
-        
-        # ページの更新間隔を設定（100ms）
-        self.page.on_interval = update_timer_callback
-        self.page.update_interval = 100
-    
     def _init_app(self):
-        """
-        アプリケーションの初期化
-        """
-        logger.info("アプリケーションの初期化を開始")
+        """アプリケーションの初期化"""
         try:
-            # ページの設定
-            self.page.title = "クラウドワークス案件モニター"
-            self.page.window.width = 1200
-            self.page.window.min_width = 800
-            self.page.window.height = 800
-            self.page.window.min_height = 600
-            self.page.scroll = ft.ScrollMode.AUTO
-            self.page.theme_mode = ft.ThemeMode.SYSTEM
-            self.page.theme = ft.Theme(
-                color_scheme_seed=ft.colors.BLUE,
-            )
-            self.page.update()
+            logging.info("アプリケーションを初期化中...")
             
-            # ウィンドウサイズ設定
-            self.page.window.width = 900
-            self.page.window.height = 900
-            self.page.window.min_width = 500
-            self.page.window.min_height = 600
-            
-            # アプリタイトル
+            # タイトル
             title = ft.Text(
-                "クラウドワークス新着案件モニター", 
-                size=24, 
+                "Crowdworks案件モニター",
+                size=24,
                 weight=ft.FontWeight.BOLD,
-                color=ft.colors.BLUE
+                color=ft.colors.INDIGO_700
             )
             
-            # 検索・フィルタリングコントロール
-            filter_controls = ft.Card(
-                content=ft.Container(
-                    content=ft.Column([
-                        ft.Text("検索条件", weight=ft.FontWeight.BOLD),
-                        self.keyword_chips,
-                        ft.Row(
-                            controls=[
-                                self.search_field,
-                            ],
-                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN
-                        ),
-                        ft.Row(
-                            controls=[
-                                self.min_price_field,
-                                self.max_price_field,
-                                self.days_dropdown,
-                                self.notification_switch,
-                                self.search_button
-                            ],
-                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN
-                        )
-                    ]),
-                    padding=10
-                )
-            )
-            
-            # メール通知設定
-            email_settings = ft.Card(
-                content=ft.Container(
-                    content=ft.Column([
-                        ft.Text("メール通知設定", weight=ft.FontWeight.BOLD),
-                        self.email_enabled_switch,
-                        self.simulation_mode_switch,
-                        self.auto_fallback_switch,
-                        ft.Text("Gmail設定（送受信兼用）", weight=ft.FontWeight.W_500, size=14),
-                        self.gmail_address_field,
-                        self.gmail_app_password_field,
-                        ft.Row(
-                            controls=[
-                                self.email_save_button,
-                                self.email_test_button
-                            ]
-                        ),
-                        
-                        # Gmail設定説明テキスト（コピー可能）
-                        ft.Text("※以下の説明はコピーできます", size=12, color=ft.colors.GREEN),
-                        
-                        # SelectionAreaでテキストを選択可能にする
-                        ft.SelectionArea(
-                            content=ft.Column([
-                                ft.TextField(
-                                    value="※メール送信には「Gmailアプリパスワード」が必要です\n"
-                                    "【アプリパスワードの取得方法（重要）】\n"
-                                    "1. Googleアカウントで2段階認証を有効にする\n"
-                                    "   https://myaccount.google.com/security にアクセス\n"
-                                    "   「2段階認証プロセス」を選択して有効化\n"
-                                    "2. 同じセキュリティページで「アプリパスワード」を選択\n"
-                                    "   (「アプリパスワード」が表示されない場合は、まず2段階認証を有効にしてください)\n"
-                                    "3. 「アプリを選択」で「その他」を選び、「CrowdWorks Monitor」と入力\n"
-                                    "4. 「生成」ボタンをクリックし、表示された16文字のパスワードをコピー\n"
-                                    "5. このアプリの「Gmailアプリパスワード」欄に、スペースなしで貼り付ける\n\n"
-                                    "※最初は「シミュレーションモード」で動作確認することをお勧めします\n"
-                                    "※通常のGmailパスワードではなく、専用の「アプリパスワード」が必要です\n"
-                                    "※エラーが続く場合は、新しいアプリパスワードを再生成してみてください",
-                                    multiline=True,
-                                    read_only=True,
-                                    min_lines=10,
-                                    max_lines=15,
-                                    text_size=12,
-                                    text_style=ft.TextStyle(color=ft.colors.BLACK),
-                                    border=ft.InputBorder.OUTLINE,
-                                    border_color=ft.colors.GREY_400,
-                                    bgcolor=ft.colors.GREY_100,
-                                    width=500,
-                                    border_radius=8,
-                                )
-                            ])
-                        ),
-                        
-                        # コピーボタン
-                        ft.ElevatedButton(
-                            "説明をクリップボードにコピー",
-                            icon=ft.icons.COPY,
-                            on_click=self._copy_instruction_text
-                        )
-                    ]),
-                    padding=20
-                )
-            )
-            
-            # 操作ボタン
-            operation_controls = ft.Row(
+            # フィルターコントロール
+            filter_controls = ft.Row(
                 controls=[
-                    self.refresh_button,
-                    self.start_button,
-                    self.stop_button,
-                    self.progress_bar,
-                    self.status_text
+                    ft.Column(
+                        controls=[
+                            ft.Row(
+                                [
+                                    self.search_field,
+                                    self.search_button,
+                                    self.search_cancel_button
+                                ],
+                                spacing=10
+                            ),
+                            self.keyword_chips
+                        ],
+                        spacing=10,
+                        expand=True
+                    ),
+                    ft.Column(
+                        controls=[
+                            ft.Row(
+                                [
+                                    ft.Text("期間:", size=14),
+                                    self.days_dropdown,
+                                    ft.Text("価格:", size=14),
+                                    self.min_price_field,
+                                    ft.Text("〜", size=14),
+                                    self.max_price_field,
+                                ],
+                                spacing=5
+                            ),
+                        ],
+                        horizontal_alignment=ft.CrossAxisAlignment.END
+                    )
                 ],
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN
-            )
-            
-            # 操作説明
-            operation_help = ft.Container(
-                content=ft.Text(
-                    "【ボタン説明】「開始」: 1時間ごとの自動更新を開始 / 「停止」: 自動更新を停止 / 「今すぐ更新」: 手動で更新",
-                    size=12,
-                    italic=True,
-                    color=ft.colors.GREY
-                ),
-                margin=ft.margin.only(bottom=10)
             )
             
             # タブ
@@ -780,7 +704,7 @@ class JobMonitorApp:
                 title,
                 filter_controls,
                 self.actions_container,
-                operation_help,  # 操作説明を追加
+                self.operation_help,  # 操作説明を追加
                 self.progress_container,  # ローディングアニメーションを追加
                 ft.Divider(),
                 ft.Container(
@@ -813,218 +737,25 @@ class JobMonitorApp:
         """UI更新をキューに追加"""
         self.ui_update_queue.put(update_func)
     
-    def _handle_search_click(self, e):
-        """検索ボタンがクリックされたときの処理"""
-        # 検索条件を更新
-        keywords_text = self.search_field.value
-        self.filter_keywords = [kw.strip() for kw in keywords_text.split(",")] if keywords_text else []
-        self.filter_days = int(self.days_dropdown.value)
-        self.notification_enabled = self.notification_switch.value
+    def _setup_ui_update_timer(self):
+        """UI更新タイマーの設定"""
+        def update_timer_callback(e):
+            self._process_ui_updates()
         
-        # 料金範囲の取得
-        try:
-            self.min_price = int(self.min_price_field.value) if self.min_price_field.value else 0
-        except ValueError:
-            self.min_price = 0
-            self.min_price_field.value = ""
-            
-        try:
-            self.max_price = int(self.max_price_field.value) if self.max_price_field.value else 0
-        except ValueError:
-            self.max_price = 0
-            self.max_price_field.value = ""
-        
-        logger.info(f"検索条件を更新: キーワード={self.filter_keywords}, 日数={self.filter_days}, 料金範囲={self.min_price}〜{self.max_price}")
-        
-        # 中断フラグをリセット
-        self.is_search_cancelled = False
-        
-        # ボタンの表示状態を更新
-        self.search_button.visible = False
-        self.search_cancel_button.visible = True
-        self.refresh_button.disabled = True
-        self.start_button.disabled = True
-        
-        # 進捗表示
-        self.progress_container.visible = True
-        self._update_status("クラウドワークスから最新データを取得中...", ft.colors.ORANGE)
-        self.page.update()
-        
-        # 非同期でクラウドワークスからデータを取得
-        threading.Thread(target=self._fetch_search_jobs).start()
+        # ページの更新間隔を設定（100ms）
+        self.page.on_interval = update_timer_callback
+        self.page.update_interval = 100
     
-    def _fetch_search_jobs(self):
-        """クラウドワークスから検索条件に合致する案件を取得"""
-        try:
-            # エラー発生時の処理を先に定義
-            def update_error():
-                self.progress_container.visible = False
-                self._update_status("検索中にエラーが発生しました", ft.colors.RED)
-                self._reset_search_buttons()
-                self.page.update()
-            
-            def update_progress(message):
-                def update():
-                    if not self.is_search_cancelled:  # 中断されていない場合のみ更新
-                        self.status_text.value = message  # progress_text → status_textに修正
-                        self.page.update()
-                self._queue_ui_update(update)
-            
-            update_progress("検索処理を開始しています...")
-            
-            # 中断されていないか確認
-            if self.is_search_cancelled:
-                logger.info("検索処理が中断されました")
-                self._reset_search_buttons()
-                return
-
-            # 中断されていないか確認
-            if self.is_search_cancelled:
-                logger.info("検索処理が中断されました")
-                self._reset_search_buttons()
-                return
-                
-            update_progress("クラウドワークスに接続中...")
-            
-            # 中断チェックポイント
-            if self.is_search_cancelled:
-                logger.info("検索処理が中断されました")
-                self._reset_search_buttons()
-                return
-                
-            # キーワードフィルタリング
-            keyword_str = ",".join(self.filter_keywords) if self.filter_keywords else ""
-            
-            update_progress(f"キーワード '{keyword_str}' で検索中...")
-            
-            # 元のscraperを使用
-            jobs = self.scraper.get_job_offers()
-            
-            # 中断されていないか確認
-            if self.is_search_cancelled:
-                logger.info("検索処理が中断されました")
-                self._reset_search_buttons()
-                return
-            
-            def update_search_result():
-                # プログレスインジケーターを非表示に
-                self.progress_container.visible = False
-                
-                # 結果を表示
-                if not jobs:
-                    self._update_status("検索条件に合致する案件は見つかりませんでした", ft.colors.ORANGE)
-                else:
-                    self._display_search_jobs(jobs)
-                    self._update_status(f"{len(jobs)}件の案件が見つかりました", ft.colors.GREEN)
-                
-                # ボタンの状態を元に戻す
-                self._reset_search_buttons()
-                self.page.update()
-            
-            # 結果更新処理をキューに追加
-            self._queue_ui_update(update_search_result)
-            
-        except Exception as e:
-            logger.error(f"検索処理中にエラーが発生しました: {e}")
-            # ここでupdate_errorがスコープ内にあることを確認
-            try:
-                self._queue_ui_update(update_error)
-            except Exception as inner_e:
-                logger.error(f"エラー処理中に二次的なエラーが発生しました: {inner_e}")
-                def emergency_reset():
-                    self.progress_container.visible = False
-                    self._update_status("検索中に重大なエラーが発生しました", ft.colors.RED)
-                    self._reset_search_buttons()
-                    self.page.update()
-                self._queue_ui_update(emergency_reset)
-    
-    def _display_search_jobs(self, jobs: List[Dict[str, Any]]):
+    def _toggle_email_settings(self, e):
         """
-        検索結果の仕事情報をUIに表示
+        メール設定の切り替え
         
         Args:
-            jobs: クラウドワークスから直接取得した仕事情報
+            e: イベントオブジェクト
         """
-        try:
-            # 処理開始のログ
-            logger.info("検索結果表示処理を開始")
-            
-            # フィルタリング
-            logger.info(f"フィルタリング開始: {len(jobs)}件の仕事, 条件: 日数={self.filter_days}, キーワード={self.filter_keywords}")
-            
-            # 日付フィルタリング（取得した日から指定日数以内）
-            filtered_jobs = []
-            for job in jobs:
-                if self._is_within_days(job, self.filter_days):
-                    filtered_jobs.append(job)
-            
-            logger.info(f"日付フィルタリング後: {len(filtered_jobs)}件")
-            
-            # キーワードフィルタリング
-            if self.filter_keywords:
-                filtered_jobs = self.scraper.search_jobs_by_keyword(filtered_jobs, self.filter_keywords)
-            
-            # 料金フィルタリング
-            if self.min_price > 0 or self.max_price > 0:
-                filtered_jobs = [
-                    job for job in filtered_jobs 
-                    if self._price_in_range(job, self.min_price, self.max_price)
-                ]
-            
-            logger.info(f"フィルタリング後の仕事数: {len(filtered_jobs)}件")
-            
-            # 例外処理を追加して、日付のパースエラーでも処理が止まらないようにする
-            try:
-                # 日付の新しい順に並べ替え
-                filtered_jobs.sort(
-                    key=self._get_job_date_for_sorting,
-                    reverse=True  # 降順（新しい順）
-                )
-                logger.info("仕事の並べ替えが完了しました")
-            except Exception as e:
-                logger.error(f"仕事の並べ替え中にエラーが発生: {e}")
-            
-            # 表示の更新
-            self.job_list.controls = []
-            logger.info("UI更新処理を開始")
-            
-            for job in filtered_jobs:
-                self.job_list.controls.append(self._create_job_card(job))
-            
-            self.page.update()
-            logger.info("案件表示処理が完了しました")
-            
-        except Exception as e:
-            logger.error(f"案件表示処理中にエラーが発生: {e}", exc_info=True)
-            self._update_status(f"エラー: {str(e)}", ft.colors.RED)
-    
-    def _price_in_range(self, job: Dict[str, Any], min_price: int, max_price: int) -> bool:
-        """
-        料金が指定範囲内かどうかを判定
-        
-        Args:
-            job: 仕事情報
-            min_price: 最小料金（0は制限なし）
-            max_price: 最大料金（0は制限なし）
-            
-        Returns:
-            料金が範囲内の場合はTrue
-        """
-        job_price = self._get_job_price(job)
-        
-        # 料金情報がない場合は除外
-        if job_price < 0:
-            return False
-            
-        # 最小料金チェック（min_price が 0 の場合は制限なし）
-        if min_price > 0 and job_price < min_price:
-            return False
-            
-        # 最大料金チェック（max_price が 0 の場合は制限なし）
-        if max_price > 0 and job_price > max_price:
-            return False
-            
-        return True
+        self.email_enabled_switch.value = e.control.value
+        self._save_email_config()
+        self._update_operation_buttons_state()
     
     def _handle_refresh_click(self, e):
         """
@@ -1058,7 +789,7 @@ class JobMonitorApp:
             
             self._queue_ui_update(show_mail_dialog)
         
-        # プログレスインジケーターのみを表示して処理状態を示す
+        # プログレスインジケータのみを表示して処理状態を示す
         self.progress_bar.visible = True
         self.status_text.value = "更新中..."
         self.status_text.color = ft.colors.ORANGE
@@ -1280,9 +1011,7 @@ class JobMonitorApp:
     
     def _update_status(self, message: str, color=ft.colors.GREEN):
         """ステータスメッセージを更新"""
-        self.status_text.value = message
-        self.status_text.color = color
-        self.page.update()
+        update_status(self.status_text, message, color, self.page)
     
     def _filter_jobs(self, jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -1305,7 +1034,7 @@ class JobMonitorApp:
         if self.filter_days > 0:
             date_filtered = []
             for job in filtered_jobs:
-                if self._is_within_days(job, self.filter_days):
+                if is_within_days(job, self.filter_days):
                     date_filtered.append(job)
             filtered_jobs = date_filtered
             logger.info(f"日付フィルタリング後: {len(filtered_jobs)}件")
@@ -1329,21 +1058,11 @@ class JobMonitorApp:
         if self.min_price > 0 or self.max_price > 0:
             price_filtered = []
             for job in filtered_jobs:
-                job_price = self._get_job_price(job)
-                
-                # 最低料金のチェック
-                if self.min_price > 0 and job_price < self.min_price:
-                    continue
-                
-                # 最高料金のチェック（0の場合は上限なし）
-                if self.max_price > 0 and job_price > self.max_price:
-                    continue
-                
-                price_filtered.append(job)
-                
+                if price_in_range(job, self.min_price, self.max_price):
+                    price_filtered.append(job)
             filtered_jobs = price_filtered
             logger.info(f"料金フィルタリング後: {len(filtered_jobs)}件")
-        
+            
         return filtered_jobs
     
     def _get_job_price(self, job: Dict[str, Any]) -> int:
@@ -1354,362 +1073,223 @@ class JobMonitorApp:
             job: 仕事情報の辞書
             
         Returns:
-            料金（整数）。料金が特定できない場合は0を返す
+            料金（整数）。料金が特定できない場合は-1を返す
         """
         try:
-            payment_info = job.get('payment_info', {})
+            payment_info = job.get('payment_info', '')
             
-            # 文字列の場合
+            # 文字列の場合（新しいスクレイパー形式）
             if isinstance(payment_info, str):
                 # 数字だけを抽出して返す
                 import re
-                numbers = re.findall(r'\d+', payment_info)
+                
+                # 「〜」記号で分割して最初の数値を取得（最低額）
+                parts = payment_info.split('〜')
+                if len(parts) > 1:
+                    # 「5,000円 〜 10,000円」 形式の場合、最初の部分から数値を抽出
+                    numbers = re.findall(r'(\d[\d,]*)', parts[0])
+                    if numbers:
+                        # カンマを除去して整数に変換
+                        return int(numbers[0].replace(',', ''))
+                        
+                # 「〜 5,000円」 形式の場合は2つ目の部分から数値を抽出
+                if payment_info.startswith('〜'):
+                    numbers = re.findall(r'(\d[\d,]*)', payment_info)
+                    if numbers:
+                        return int(numbers[0].replace(',', ''))
+                
+                # 上記でないなら単純に数値を抽出
+                numbers = re.findall(r'(\d[\d,]*)', payment_info)
                 if numbers:
-                    return int(numbers[0])
-                return 0
+                    # 最初の数値を返す（カンマを除去）
+                    return int(numbers[0].replace(',', ''))
+                    
+                # 数値がない場合
+                logger.warning(f"料金情報から数値を抽出できませんでした: {payment_info}")
+                return -1
             
-            # 辞書でない場合
-            if not isinstance(payment_info, dict):
-                logger.warning(f"支払い情報の形式が不正: {type(payment_info)}, job_id: {job.get('id', 'unknown')}")
-                return 0
+            # 辞書形式の場合（古い形式）
+            if isinstance(payment_info, dict):
+                payment_type = payment_info.get('type', '')
+                
+                if payment_type == 'fixed_price':
+                    return payment_info.get('price', 0)
+                elif payment_type == 'hourly':
+                    # 時給の場合は最低額を返す
+                    return payment_info.get('min_price', 0)
+                elif payment_type == 'writing_payment':
+                    # 執筆単価の場合、単価を返す
+                    return payment_info.get('price', 0)
+                    
+                logger.warning(f"未知の料金タイプ: {payment_type}")
+                return -1
             
-            payment_type = payment_info.get('type', '')
+            # payment_infoが不正な形式の場合
+            logger.warning(f"支払い情報の形式が不正: {type(payment_info)}, job_id: {job.get('id', 'unknown')}")
+            return -1
             
-            if payment_type == 'fixed_price':
-                return payment_info.get('price', 0)
-            elif payment_type == 'hourly':
-                # 時給の場合は最低額を返す
-                return payment_info.get('min_price', 0)
-            elif payment_type == 'writing_payment':
-                # 執筆単価の場合、単価を返す
-                return payment_info.get('price', 0)
-            else:
-                return 0
         except Exception as e:
             logger.error(f"料金の取得に失敗しました: {e}, job_id: {job.get('id', 'unknown')}")
-            return 0
+            logger.error(f"支払い情報の整形中にエラーが発生しました: {e}, job_id: {job.get('id', 'unknown')}")
+            return "報酬情報の取得に失敗"
     
-    def _parse_date(self, date_str: str) -> Optional[datetime]:
-        """
-        日付文字列をパースしてdatetimeオブジェクトを返す
-        常にタイムゾーン情報を持ったdatetimeを返す
-        
-        Args:
-            date_str: ISO形式の日付文字列
-            
-        Returns:
-            タイムゾーン情報を持ったdatetimeオブジェクト、または None（パース失敗時）
-        """
+    def _format_date(self, date_str: str) -> str:
+        """日付文字列を整形"""
         if not date_str:
-            return None
-            
-        try:
-            # ISO形式の日付文字列をパース
-            # 例: 2023-03-04T04:40:33+09:00 または 2023-03-04T04:40:33Z
-            if date_str.endswith('Z'):
-                # UTCのタイムゾーン情報に変換
-                dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-            else:
-                # すでにタイムゾーン情報がある
-                dt = datetime.fromisoformat(date_str)
-            
-            return dt
-        except ValueError as e:
-            logger.error(f"日付文字列のパースに失敗: {e}, date_str: {date_str}")
-            return None
-    
-    def _is_within_days(self, job: Dict[str, Any], days: int) -> bool:
-        """ジョブが指定した日数以内かどうかを判定"""
-        try:
-            last_released_str = job.get('last_released_at', '')
-            if not last_released_str:
-                return False
-            
-            # 日付文字列をパース
-            last_released = self._parse_date(last_released_str)
-            if not last_released:
-                return False
-            
-            # 現在時刻をタイムゾーン付きで取得
-            now = datetime.now(timezone.utc).astimezone(JST)
-            
-            # タイムゾーン付きの日時同士で比較
-            delta = now - last_released
-            return delta.days < days
-        except Exception as e:
-            logger.error(f"日付処理エラー: {e}, job_id: {job.get('id', 'unknown')}")
-            return False
-    
-    def _get_job_date_for_sorting(self, job: Dict[str, Any]) -> datetime:
-        """ソート用に日付を取得（デフォルト値付き）"""
-        date_str = job.get('last_released_at', '')
+            return "なし"
+        
         dt = self._parse_date(date_str)
         if dt:
-            return dt
+            return dt.strftime('%Y/%m/%d %H:%M')
         else:
-            # パースに失敗した場合は最も古い日付を返す
-            return datetime(1970, 1, 1, tzinfo=timezone.utc)
+            return "日付不明"
     
-    def _display_jobs(self):
+    def _show_notification(self, message: str, color=None):
+        """通知を表示"""
+        show_notification(self.page, message, color)
+    
+    def _validate_email_config(self) -> bool:
         """
-        仕事情報をUIに表示
+        メール設定のバリデーション
         
-        フィルタリングされた仕事情報を取得し、UI上に表示します。
-        仕事は公開日時の新しい順（降順）に並び替えられます。
+        入力されたメール設定が有効かどうかを検証します。
+        
+        Returns:
+            bool: 設定が有効な場合はTrue、そうでない場合はFalse
         """
         try:
-            # 処理開始のログ
-            logger.info("案件表示処理を開始")
-            
-            # 全ての仕事を取得
-            all_jobs = self.storage.get_all_jobs()
-            logger.info(f"保存済みの仕事数: {len(all_jobs)}件")
-            
-            # フィルタリング
-            filtered_jobs = self._filter_jobs(all_jobs)
-            logger.info(f"フィルタリング後の仕事数: {len(filtered_jobs)}件")
-            
-            # 例外処理を追加して、日付のパースエラーでも処理が止まらないようにする
-            try:
-                # 日付の新しい順に並べ替え
-                filtered_jobs.sort(
-                    key=self._get_job_date_for_sorting,
-                    reverse=True  # 降順（新しい順）
-                )
-                logger.info("仕事の並べ替えが完了しました")
-            except Exception as e:
-                logger.error(f"仕事の並べ替え中にエラーが発生しました: {e}")
-                # 並べ替えに失敗してもプロセスを続行
-            
-            # UIの更新を開始
-            logger.info("UI更新処理を開始")
-            
-            # リストをクリア
-            self.job_list.controls.clear()
-            
-            # 進捗表示
-            job_count = len(filtered_jobs)
-            self._update_status(f"{job_count}件の案件を表示中...", ft.colors.BLUE)
-            
-            # 仕事カードを追加
-            for i, job in enumerate(filtered_jobs):
-                try:
-                    self.job_list.controls.append(self._create_job_card(job))
-                    # 10件ごとに進捗更新
-                    if (i + 1) % 10 == 0:
-                        self._update_status(f"{i + 1}/{job_count}件の案件を表示中...", ft.colors.BLUE)
-                        self.page.update()
-                except Exception as e:
-                    logger.error(f"カード作成中にエラーが発生しました: {e}, job_id: {job.get('id', 'unknown')}")
-                    # 1つのカードの作成に失敗しても、他のカードの処理を続行
-            
-            # 案件がない場合のメッセージ
-            if not filtered_jobs:
-                self.job_list.controls.append(
-                    ft.Container(
-                        content=ft.Text("条件に一致する案件がありません", color=ft.colors.GREY, size=16),
-                        alignment=ft.alignment.center,
-                        padding=40
-                    )
-                )
-            
-            # 完了ステータスの更新
-            self._update_status(f"{len(filtered_jobs)}件の案件を表示中", ft.colors.GREEN)
-            
-            # UIを更新
-            self.page.update()
-            logger.info("案件表示処理が完了しました")
+            # Gmail設定のチェック
+            gmail_address = self.gmail_address_field.value.strip()
+            if not gmail_address or '@' not in gmail_address:
+                self._show_notification("Gmailアドレスを入力してください")
+                return False
+                
+            # アプリパスワードのチェック
+            app_password = self.gmail_app_password_field.value.strip()
+            if not app_password:
+                self._show_notification("Gmailアプリパスワードを入力してください")
+                return False
+                
+            # アプリパスワードの長さチェック（通常16文字）
+            if len(app_password) != 16:
+                self._show_notification("Gmailアプリパスワードは通常16文字です。確認してください。", ft.colors.AMBER)
+                # 警告だけで続行可能
+                
+            return True
             
         except Exception as e:
-            logger.error(f"案件表示中にエラーが発生しました: {e}")
-            self._show_notification(f"案件の表示に失敗しました: {str(e)}")
-            # エラーステータスに更新
-            self._update_status(f"表示エラー: {str(e)}", ft.colors.RED)
+            logger.error(f"メール設定のバリデーションに失敗しました: {e}")
+            self._show_notification(f"設定の検証に失敗しました: {str(e)}")
+            return False
     
-    def _create_job_card(self, job: Dict[str, Any]) -> ft.Card:
+    def _send_email_notification(self, subject: str, jobs: List[Dict[str, Any]], is_test: bool = False):
         """
-        求人情報からカードUIを作成
+        メール通知を送信
         
         Args:
-            job: 求人情報の辞書
-            
-        Returns:
-            求人情報を表示するカードUI
+            subject: メールの件名
+            jobs: 通知する仕事情報のリスト
+            is_test: テストメールかどうか
         """
         try:
-            # デフォルト値を設定して、キーが存在しない場合にもエラーにならないようにする
-            job_id = job.get('id', 'unknown')
-            job_title = job.get('title', '(タイトルなし)')
-            job_description = job.get('description', '(説明なし)')
-            job_url = job.get('url', '#')
-            is_new = job.get('is_new', False)  # 新着フラグ
-            
-            # URLを確実に取得
-            if not job_url or job_url == '#':
-                # IDがあればURLを構築
-                if job_id and job_id != 'unknown':
-                    job_url = f"https://crowdworks.jp/public/jobs/{job_id}"
-            
-            # タイトル行の作成（クリック可能にする）
-            title_text = ft.Text(
-                job_title,
-                style=ft.TextThemeStyle.TITLE_MEDIUM,
-                color=ft.colors.BLUE,
-                weight=ft.FontWeight.BOLD,
-                overflow=ft.TextOverflow.ELLIPSIS,
-                expand=True,
-                selectable=False,  # クリックの都合上、選択不可に
-            )
-            
-            title_row = ft.Row([
-                title_text,
-            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
-            
-            # タグのリスト
-            tags = []
-            
-            # 新着の場合は新着タグを追加
-            if is_new:
-                tags.append(
-                    ft.Container(
-                        ft.Text("新着", size=12, color=ft.colors.WHITE),
-                        bgcolor=ft.colors.GREEN,
-                        border_radius=5,
-                        padding=ft.padding.only(left=5, right=5, top=2, bottom=2),
-                    )
-                )
-            
-            # PR案件の場合はPRタグを追加
-            if job.get("is_pr", False):
-                tags.append(
-                    ft.Container(
-                        ft.Text("PR", size=12, color=ft.colors.WHITE),
-                        bgcolor=ft.colors.ORANGE,
-                        border_radius=5,
-                        padding=ft.padding.only(left=5, right=5, top=2, bottom=2),
-                    )
-                )
-            
-            # 特急案件の場合は特急タグを追加
-            if "特急" in job_title or "急募" in job_title:
-                tags.append(
-                    ft.Container(
-                        ft.Text("急募", size=12, color=ft.colors.WHITE),
-                        bgcolor=ft.colors.RED,
-                        border_radius=5,
-                        padding=ft.padding.only(left=5, right=5, top=2, bottom=2),
-                    )
-                )
-            
-            # タグが存在する場合はタグ行を作成
-            tags_row = ft.Row(tags, spacing=5, wrap=True) if tags else None
-            
-            # 支払い情報を整形
-            payment_text = self._format_payment_text(job)
-            
-            # 公開日・締切日を整形
-            publish_date = self._format_date(job.get('last_released_at', ''))
-            expire_date = self._format_date(job.get('expire_at', ''))
-            
-            # 説明の作成
-            description = ft.Text(
-                job_description,
-                size=14,
-                max_lines=3,
-                overflow=ft.TextOverflow.ELLIPSIS,
-            )
-            
-            # カード用のテキスト行を作成
-            info_rows = [
-                ft.Row([
-                    ft.Icon(ft.icons.MONETIZATION_ON, color=ft.colors.GREEN, size=16),
-                    ft.Text(payment_text, size=14),
-                ], spacing=5, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            # メール設定が有効でない場合は送信しない
+            if not self.email_config.get("enabled", False):
+                logger.info("メール通知が無効なため、送信をスキップします")
+                return
                 
-                ft.Row([
-                    ft.Icon(ft.icons.ACCESS_TIME, color=ft.colors.BLUE, size=16),
-                    ft.Text(f"公開: {publish_date} / 締切: {expire_date}", size=14),
-                ], spacing=5, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            ]
-            
-            # クライアント情報の行を追加
-            client_name = job.get("client_name", "")
-            if client_name:
-                client_row = ft.Row([
-                    ft.Icon(ft.icons.PERSON, color=ft.colors.BLUE_GREY, size=16),
-                    ft.Text(client_name, size=14),
-                ], spacing=5, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+            # シミュレーションモードの場合
+            if self.email_config.get("simulation_mode", True) and not is_test:
+                logger.info("シミュレーションモードのため、実際のメール送信をスキップします")
+                self._show_notification("シミュレーションモード: メール送信をシミュレートしました", ft.colors.BLUE)
+                return
                 
-                # クライアントが認証済みの場合は認証マークを追加
-                if job.get("is_certified_client", False):
-                    client_row.controls.append(
-                        ft.Container(
-                            ft.Icon(ft.icons.VERIFIED, color=ft.colors.BLUE, size=16),
-                            tooltip="認証済みクライアント",
-                            margin=ft.margin.only(left=5),
-                        )
-                    )
+            # 送信先アドレスの取得
+            recipient = self.email_config.get("recipient", "")
+            if not recipient or '@' not in recipient:
+                logger.error("送信先メールアドレスが設定されていません")
+                self._show_notification("送信先メールアドレスが設定されていません", ft.colors.RED)
+                return
                 
-                info_rows.append(client_row)
+            # 送信元情報の取得
+            gmail_address = self.email_config.get("gmail_address", "")
+            gmail_app_password = self.email_config.get("gmail_app_password", "")
             
-            # 情報行をまとめる
-            info_column = ft.Column(info_rows, spacing=5)
+            if not gmail_address or not gmail_app_password:
+                logger.error("Gmailアドレスまたはアプリパスワードが設定されていません")
+                self._show_notification("Gmailアドレスまたはアプリパスワードが設定されていません", ft.colors.RED)
+                return
+                
+            # メール本文の作成
+            if is_test:
+                body = "これはクラウドワークス案件モニターからのテストメールです。\n\nメール通知設定が正常に機能しています。"
+            else:
+                # 仕事情報からメール本文を作成
+                body = f"クラウドワークスで{len(jobs)}件の新着案件が見つかりました。\n\n"
+                
+                for i, job in enumerate(jobs, 1):
+                    title = job.get('title', '不明')
+                    url = job.get('url', '#')
+                    payment = job.get('payment_info', '不明')
+                    
+                    body += f"{i}. {title}\n"
+                    body += f"   報酬: {payment}\n"
+                    body += f"   URL: {url}\n\n"
+                    
+                body += "\n\n--\nこのメールはクラウドワークス案件モニターによって自動送信されました。"
+                
+            # MIMEメッセージの作成
+            msg = MIMEMultipart()
+            msg['From'] = f"クラウドワークス案件モニター <{gmail_address}>"
+            msg['To'] = recipient
+            msg['Subject'] = subject
             
-            # "詳細を見る"ボタンを追加
-            details_button = ft.ElevatedButton(
-                "詳細を見る",
-                icon=ft.icons.OPEN_IN_NEW,
-                on_click=lambda e, url=job_url: self._open_url(url),
-                style=ft.ButtonStyle(
-                    shape=ft.RoundedRectangleBorder(radius=8),
-                    color=ft.colors.WHITE,
-                    bgcolor=ft.colors.CYAN_700,
-                    elevation=2,
-                    shadow_color=ft.colors.CYAN_900,
-                    animation_duration=300,  # アニメーション時間（ミリ秒）
-                ),
-            )
+            msg.attach(MIMEText(body, 'plain', 'utf-8'))
             
-            # カードの内容をまとめる
-            content_controls = [title_row]
-            if tags_row:
-                content_controls.append(tags_row)
-            content_controls.extend([description, info_column, ft.Row([details_button], alignment=ft.MainAxisAlignment.END)])
-            
-            # カード用コンテンツを作成
-            content = ft.Container(
-                ft.Column(content_controls, spacing=10),
-                padding=10
-            )
-            
-            # カードの作成
-            card = ft.Card(
-                content=content,
-                elevation=2,
-                margin=ft.margin.only(bottom=10),
-                data=job,  # データをカードに添付
-            )
-            
-            # カード全体のクリックイベントも設定（冗長性のため）
-            final_url = job_url  # ラムダ内でのキャプチャ用に変数を定義
-            card.on_click = lambda e: self._open_url(final_url)
-            
-            return card
-        
+            # SMTPサーバーに接続してメール送信
+            try:
+                server = smtplib.SMTP('smtp.gmail.com', 587)
+                server.starttls()
+                server.login(gmail_address, gmail_app_password)
+                server.send_message(msg)
+                server.quit()
+                
+                logger.info(f"メール通知を送信しました: {subject}")
+                if is_test:
+                    self._show_notification("テストメールを送信しました", ft.colors.GREEN)
+                
+            except Exception as smtp_error:
+                logger.error(f"SMTP接続エラー: {smtp_error}")
+                
+                # 自動フォールバックが有効な場合、別の方法を試みる
+                if self.email_config.get("auto_fallback", True):
+                    logger.info("フォールバック: 別の方法でメール送信を試みます")
+                    try:
+                        # 別のポートを試す
+                        server = smtplib.SMTP('smtp.gmail.com', 465)
+                        server.starttls()
+                        server.login(gmail_address, gmail_app_password)
+                        server.send_message(msg)
+                        server.quit()
+                        
+                        logger.info(f"フォールバック成功: メール通知を送信しました: {subject}")
+                        if is_test:
+                            self._show_notification("テストメールを送信しました (フォールバック成功)", ft.colors.GREEN)
+                            
+                    except Exception as fallback_error:
+                        logger.error(f"フォールバック失敗: {fallback_error}")
+                        if is_test:
+                            self._show_notification(f"テストメール送信に失敗しました: {str(fallback_error)}", ft.colors.RED)
+                        raise
+                else:
+                    if is_test:
+                        self._show_notification(f"テストメール送信に失敗しました: {str(smtp_error)}", ft.colors.RED)
+                    raise
+                    
         except Exception as e:
-            logger.error(f"カードの作成中にエラーが発生: {e}", exc_info=True)
-            # エラーが発生した場合はエラーメッセージを含むシンプルなカードを返す
-            return ft.Card(
-                content=ft.Container(
-                    ft.Column([
-                        ft.Text("カードの表示エラー", style=ft.TextThemeStyle.TITLE_MEDIUM, color=ft.colors.RED),
-                        ft.Text(f"エラー: {str(e)}", size=14),
-                    ], spacing=10),
-                    padding=10
-                ),
-                elevation=1,
-                margin=ft.margin.only(bottom=10),
-            )
+            logger.error(f"メール通知の送信に失敗しました: {e}")
+            if is_test:
+                self._show_notification(f"テストメール送信に失敗しました: {str(e)}", ft.colors.RED)
+            raise
     
     def _format_payment_text(self, job: Dict[str, Any]) -> str:
         """
@@ -1737,349 +1317,39 @@ class JobMonitorApp:
             
             if payment_type == 'fixed_price':
                 price = payment_info.get('price', 0)
-                return f"固定報酬: {price:,}円"
+                return f"{price:,}円"
+                
             elif payment_type == 'hourly':
                 min_price = payment_info.get('min_price', 0)
                 max_price = payment_info.get('max_price', 0)
-                return f"時給: {min_price:,}円〜{max_price:,}円"
+                
+                if min_price and max_price:
+                    return f"時給 {min_price:,}円 〜 {max_price:,}円"
+                elif min_price:
+                    return f"時給 {min_price:,}円〜"
+                elif max_price:
+                    return f"時給 〜{max_price:,}円"
+                return "時給"
+                
             elif payment_type == 'writing_payment':
                 price = payment_info.get('price', 0)
-                unit = payment_info.get('unit', '文字')
-                return f"執筆報酬: {price:,}円/{unit}"
-            else:
-                return "報酬情報なし"
+                min_length = payment_info.get('min_length', 0)
+                max_length = payment_info.get('max_length', 0)
+                
+                if price:
+                    base = f"記事単価 {price:,}円"
+                    if min_length and max_length:
+                        return f"{base} ({min_length:,}〜{max_length:,}文字)"
+                    return base
+                return "記事単価"
+                
+            # 未知の支払い形式
+            return "報酬情報あり"
+        
         except Exception as e:
             logger.error(f"支払い情報の整形中にエラーが発生しました: {e}, job_id: {job.get('id', 'unknown')}")
-            return "報酬情報の取得に失敗"
+            return "報酬情報なし"
     
-    def _format_date(self, date_str: str) -> str:
-        """日付文字列を整形"""
-        if not date_str:
-            return "なし"
-        
-        dt = self._parse_date(date_str)
-        if dt:
-            return dt.strftime('%Y/%m/%d %H:%M')
-        else:
-            return "日付不明"
-    
-    def _show_notification(self, message: str, color=None):
-        """通知を表示"""
-        try:
-            # 最新のFlet推奨方法でSnackBarを表示する
-            snack = ft.SnackBar(
-                content=ft.Text(message, color=color),
-                action="閉じる",
-                open=True
-            )
-            # overlayに追加して表示
-            if hasattr(self.page, "overlay") and self.page.overlay is not None:
-                self.page.overlay.append(snack)
-                self.page.update()
-            else:
-                logger.warning("page.overlayにアクセスできません。通知が表示されない可能性があります。")
-        except Exception as e:
-            logger.error(f"通知の表示に失敗しました: {e}")
-    
-    def _validate_email_config(self) -> bool:
-        """
-        メール設定のバリデーション
-        
-        入力されたメール設定が有効かどうかを検証します。
-        
-        Returns:
-            bool: 設定が有効な場合はTrue、そうでない場合はFalse
-        """
-        try:
-            # Gmail設定のチェック
-            gmail_address = self.gmail_address_field.value.strip()
-            if not gmail_address or '@' not in gmail_address:
-                self._show_notification("Gmailアドレスを入力してください")
-                return False
-                
-            if not gmail_address.lower().endswith('@gmail.com'):
-                self._show_notification("@gmail.comのアドレスを使用してください")
-                return False
-            
-            # メールアドレスのバリデーション（簡易チェック）
-            email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-            if not re.match(email_pattern, gmail_address):
-                self._show_notification("メールアドレスの形式が正しくありません")
-                return False
-            
-            gmail_app_password = self.gmail_app_password_field.value
-            if not gmail_app_password:
-                self._show_notification("Gmailアプリパスワードを入力してください")
-                return False
-            
-            # アプリパスワードは通常16文字
-            if len(gmail_app_password) < 12:
-                self._show_notification("Gmailアプリパスワードが短すぎます。正しいアプリパスワードを確認してください", ft.colors.AMBER)
-            
-            return True
-        
-        except Exception as e:
-            logger.error(f"メール設定のバリデーション中にエラーが発生: {e}", exc_info=True)
-            self._show_notification(f"メール設定の検証中にエラーが発生しました: {str(e)}")
-            return False
-    
-    def _send_email_notification(self, subject: str, jobs: List[Dict[str, Any]], is_test: bool = False):
-        """
-        メール通知を送信
-        
-        Args:
-            subject: メールの件名
-            jobs: 新着案件のリスト
-            is_test: テストメールかどうか
-        """
-        try:
-            if not is_test and not self._validate_email_config():
-                return
-            
-            # メール設定の取得
-            gmail_address = self.email_config.get("gmail_address", "")
-            gmail_app_password = self.email_config.get("gmail_app_password", "")
-            simulation_mode = self.email_config.get("simulation_mode", False)
-            
-            # Gmailアドレスがない場合は中止
-            if not gmail_address:
-                logger.warning("Gmailアドレスが設定されていません")
-                if not is_test:
-                    self._show_notification("Gmailアドレスが設定されていません。設定を確認してください。")
-                return
-            
-            # アプリパスワードがない場合は中止
-            if not gmail_app_password:
-                logger.warning("Gmailアプリパスワードが設定されていません")
-                self._show_notification("Gmailアプリパスワードが設定されていません。設定を確認してください。")
-                return
-            
-            # メールの内容作成
-            # テストメールの場合
-            if is_test:
-                text_content = "これはテストメールです。クラウドワークス新着案件モニターからのメール通知が正常に機能しています。"
-                html_content = """
-                <html>
-                <head></head>
-                <body>
-                    <h2>クラウドワークス新着案件モニター - テストメール</h2>
-                    <p>これはテストメールです。メール通知が正常に機能しています。</p>
-                </body>
-                </html>
-                """
-            else:
-                # 新着案件の一覧
-                job_list_text = ""
-                job_list_html = ""
-                
-                for i, job in enumerate(jobs[:10]):  # 最大10件まで
-                    job_title = job.get("title", "タイトルなし")
-                    job_url = job.get("url", "#")
-                    payment_text = self._format_payment_text(job)
-                    
-                    job_list_text += f"{i+1}. {job_title} - {payment_text}\n"
-                    job_list_html += f"""
-                    <tr>
-                        <td>{i+1}</td>
-                        <td><a href="{job_url}">{job_title}</a></td>
-                        <td>{payment_text}</td>
-                    </tr>
-                    """
-                
-                if len(jobs) > 10:
-                    job_list_text += f"\n... 他 {len(jobs) - 10} 件"
-                    job_list_html += f"""
-                    <tr>
-                        <td colspan="3">... 他 {len(jobs) - 10} 件</td>
-                    </tr>
-                    """
-                
-                text_content = f"""
-                クラウドワークスに{len(jobs)}件の新着案件があります。
-                
-                【新着案件一覧】
-                {job_list_text}
-                
-                詳細はアプリケーションでご確認ください。
-                """
-                
-                html_content = f"""
-                <html>
-                <head></head>
-                <body>
-                    <h2>クラウドワークス新着案件のお知らせ</h2>
-                    <p>クラウドワークスに<strong>{len(jobs)}件</strong>の新着案件があります。</p>
-                    
-                    <h3>新着案件一覧</h3>
-                    <table border="1" cellpadding="5">
-                        <tr>
-                            <th>#</th>
-                            <th>タイトル</th>
-                            <th>報酬</th>
-                        </tr>
-                        {job_list_html}
-                    </table>
-                    
-                    <p>詳細はアプリケーションでご確認ください。</p>
-                </body>
-                </html>
-                """
-            
-            # メールの作成
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = subject or "クラウドワークス新着案件のお知らせ"
-            msg["From"] = gmail_address
-            msg["To"] = gmail_address
-            
-            # MIMEテキストの作成
-            part1 = MIMEText(text_content, "plain", "utf-8")
-            part2 = MIMEText(html_content, "html", "utf-8")
-            
-            # マルチパートメッセージにテキストを追加
-            msg.attach(part1)
-            msg.attach(part2)
-            
-            # シミュレーションモードの場合
-            if simulation_mode:
-                logger.info(f"【シミュレーション】メール通知をシミュレートしました: {gmail_address}")
-                self._show_notification(f"【シミュレーション】メール送信をシミュレートしました: {gmail_address}")
-                self._update_status("【シミュレーション】メール送信完了", ft.colors.GREEN)
-                
-                # 最終送信時刻を更新
-                if not is_test:
-                    now = datetime.now(timezone.utc).astimezone(JST)
-                    self.email_config["last_sent"] = now.isoformat()
-                    self._save_email_config()
-                return
-            
-            # メール送信
-            self._update_status("メール送信中...", ft.colors.ORANGE)
-            
-            try:
-                # GmailのSMTPサーバーに接続（SSLを使用）
-                with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-                    server.set_debuglevel(1)  # デバッグレベルを設定（問題の調査に役立つ）
-                    # SSLモードではstarttls()は不要
-                    server.login(gmail_address, gmail_app_password)
-                    server.send_message(msg)
-                
-                logger.info(f"メール通知を送信しました: {gmail_address}")
-                self._show_notification(f"メールを{gmail_address}に送信しました")
-                self._update_status("メール送信完了", ft.colors.GREEN)
-            except smtplib.SMTPAuthenticationError as auth_error:
-                # 認証エラーに対するより詳細な情報を提供
-                error_msg = str(auth_error)
-                logger.error(f"メール送信認証エラー: {auth_error}")
-                
-                # エラーメッセージの内容に基づいて適切なアドバイスを表示
-                advice = ""
-                
-                # アプリパスワードが必要なエラー
-                if "Application-specific password required" in error_msg:
-                    advice = (
-                        "Gmailの2段階認証で保護されたアカウントには「アプリパスワード」が必要です：\n\n"
-                        "【アプリパスワードの取得方法】\n"
-                        "1. https://myaccount.google.com/security にアクセス\n"
-                        "2. 「2段階認証プロセス」を選択\n"
-                        "3. 下にスクロールして「アプリパスワード」を選択\n"
-                        "4. アプリ名に「CrowdWorks Monitor」と入力して作成\n"
-                        "5. 生成された16文字のパスワードをコピーして入力する\n\n"
-                        "※スペースなしの16文字のパスワードをそのまま入力してください\n"
-                        "※Googleアカウントにログインするには: https://accounts.google.com"
-                    )
-                # ユーザー名とパスワードが受け付けられないエラー
-                elif "Username and Password not accepted" in error_msg:
-                    advice = (
-                        "Gmailのユーザー名またはパスワードが正しくありません：\n\n"
-                        "1. Gmailアドレスを正確に入力しているか確認してください\n"
-                        "2. アプリパスワードが正しいか確認してください\n"
-                        "3. パスワードを手動で再入力してみてください（コピペではなく）\n"
-                        "4. Googleアカウントにログインし、セキュリティに問題がないか確認してください\n\n"
-                        "※通常のパスワードではなく、「アプリパスワード」を使用してください\n"
-                        "※Googleアカウントにログインするには: https://accounts.google.com"
-                    )
-                # その他の認証エラー
-                else:
-                    advice = (
-                        f"Gmailの認証に失敗しました。以下を確認してください：\n\n"
-                        "1. Gmailアドレスが正しく入力されているか\n"
-                        "2. Googleアカウントで2段階認証が有効になっているか\n"
-                        "3. アプリパスワードが正しいか（16文字、スペースなし）\n"
-                        "4. パスワードを手動で再入力してみてください（コピペではなく）\n\n"
-                        "【アプリパスワードの取得方法】\n"
-                        "1. https://myaccount.google.com/security にアクセス\n"
-                        "2. 「アプリパスワード」を選択して作成\n\n"
-                        "※エラーの詳細: {error_msg}"
-                    )
-                
-                # 詳細なエラー情報をログに記録
-                logger.error(f"認証エラーの詳細情報: {error_msg}")
-                
-                self._show_notification(advice, ft.colors.RED)
-                
-                # 自動フォールバックがオンの場合
-                if self.email_config.get("auto_fallback", True):
-                    self.email_config["simulation_mode"] = True
-                    self._save_email_config()
-                    self._show_notification("認証エラーのため、自動的にシミュレーションモードに切り替えました", ft.colors.AMBER)
-                    
-                    # シミュレーションモードで再試行
-                    self._update_status("【シミュレーション】メール送信をシミュレート中...", ft.colors.ORANGE)
-                    logger.info(f"【シミュレーション】メール通知をシミュレートしました: {gmail_address}")
-                    self._show_notification(f"【シミュレーション】メール送信をシミュレートしました: {gmail_address}")
-                    self._update_status("【シミュレーション】メール送信完了", ft.colors.GREEN)
-                    
-                    # 最終送信時刻を更新
-                    if not is_test:
-                        now = datetime.now(timezone.utc).astimezone(JST)
-                        self.email_config["last_sent"] = now.isoformat()
-                        self._save_email_config()
-                else:
-                    self._update_status("メール送信に失敗しました", ft.colors.RED)
-            except Exception as mail_error:
-                # その他のエラー
-                logger.error(f"メール送信エラー: {mail_error}")
-                self._show_notification(f"メール送信に失敗しました: {str(mail_error)}")
-                self._update_status("メール送信に失敗しました", ft.colors.RED)
-                
-                # 自動フォールバックがオンの場合
-                if self.email_config.get("auto_fallback", True):
-                    self.email_config["simulation_mode"] = True
-                    self._save_email_config()
-                    self._show_notification("エラーのため、自動的にシミュレーションモードに切り替えました", ft.colors.AMBER)
-                    
-                    # シミュレーションモードで再試行
-                    self._update_status("【シミュレーション】メール送信をシミュレート中...", ft.colors.ORANGE)
-                    logger.info(f"【シミュレーション】メール通知をシミュレートしました: {gmail_address}")
-                    self._show_notification(f"【シミュレーション】メール送信をシミュレートしました: {gmail_address}")
-                    self._update_status("【シミュレーション】メール送信完了", ft.colors.GREEN)
-                    
-                    # 最終送信時刻を更新
-                    if not is_test:
-                        now = datetime.now(timezone.utc).astimezone(JST)
-                        self.email_config["last_sent"] = now.isoformat()
-                        self._save_email_config()
-                
-                # エラーの詳細情報をログに記録
-                logger.error("メール送信詳細エラー:", exc_info=True)
-            
-            # 最終送信時刻を更新
-            if not is_test:
-                now = datetime.now(timezone.utc).astimezone(JST)
-                self.email_config["last_sent"] = now.isoformat()
-                self._save_email_config()
-        
-        except Exception as e:
-            logger.error(f"メール通知処理に失敗しました: {e}", exc_info=True)
-            if not is_test:
-                self._show_notification(f"メール通知処理に失敗しました: {str(e)}")
-                
-                # 自動フォールバックがオンの場合
-                if self.email_config.get("auto_fallback", True):
-                    self.email_config["simulation_mode"] = True
-                    self._save_email_config()
-                    self._show_notification("エラーのため、自動的にシミュレーションモードに切り替えました", ft.colors.AMBER)
-                    
     def _open_email_settings(self, e=None):
         """
         メール設定画面を開く
@@ -2118,107 +1388,18 @@ class JobMonitorApp:
             self._show_notification(f"URLを開けませんでした: {str(e)}")
     
     def _create_settings_tab(self):
-        """設定タブのコンテンツを作成"""
-        # シミュレーションモードスイッチの追加
-        self.simulation_mode_switch = ft.Switch(
-            label="シミュレーションモード（メール送信をシミュレートする）",
-            value=self.email_config.get("simulation_mode", True),  # デフォルトでシミュレーションモードを有効に
-            on_change=lambda e: self._toggle_simulation_mode(e)
+        """設定タブを作成"""
+        return create_settings_tab(
+            self.email_enabled_switch,
+            self.simulation_mode_switch,
+            self.auto_fallback_switch,
+            self.gmail_address_field,
+            self.gmail_app_password_field,
+            self.email_save_button,
+            self.email_test_button,
+            self._copy_instruction_text
         )
-        
-        # 自動フォールバックスイッチの追加
-        self.auto_fallback_switch = ft.Switch(
-            label="エラー時にシミュレーションモードに自動切り替え",
-            value=self.email_config.get("auto_fallback", True),
-            on_change=lambda e: self._toggle_auto_fallback(e)
-        )
-        
-        # メール通知設定カード
-        email_settings = ft.Card(
-            content=ft.Container(
-                content=ft.Column([
-                    ft.Text("メール通知設定", weight=ft.FontWeight.BOLD),
-                    self.email_enabled_switch,
-                    self.simulation_mode_switch,
-                    self.auto_fallback_switch,
-                    ft.Text("Gmail設定（送受信兼用）", weight=ft.FontWeight.W_500, size=14),
-                    self.gmail_address_field,
-                    self.gmail_app_password_field,
-                    ft.Row(
-                        controls=[
-                            self.email_save_button,
-                            self.email_test_button
-                        ]
-                    ),
-                    
-                    # Gmail設定説明テキスト（コピー可能）
-                    ft.Text("※以下の説明はコピーできます", size=12, color=ft.colors.GREEN),
-                    
-                    # SelectionAreaでテキストを選択可能にする
-                    ft.SelectionArea(
-                        content=ft.Column([
-                            ft.TextField(
-                                value="※メール送信には「Gmailアプリパスワード」が必要です\n"
-                                "【アプリパスワードの取得方法（重要）】\n"
-                                "1. Googleアカウントで2段階認証を有効にする\n"
-                                "   https://myaccount.google.com/security にアクセス\n"
-                                "   「2段階認証プロセス」を選択して有効化\n"
-                                "2. 同じセキュリティページで「アプリパスワード」を選択\n"
-                                "   (「アプリパスワード」が表示されない場合は、まず2段階認証を有効にしてください)\n"
-                                "3. 「アプリを選択」で「その他」を選び、「CrowdWorks Monitor」と入力\n"
-                                "4. 「生成」ボタンをクリックし、表示された16文字のパスワードをコピー\n"
-                                "5. このアプリの「Gmailアプリパスワード」欄に、スペースなしで貼り付ける\n\n"
-                                "※最初は「シミュレーションモード」で動作確認することをお勧めします\n"
-                                "※通常のGmailパスワードではなく、専用の「アプリパスワード」が必要です\n"
-                                "※エラーが続く場合は、新しいアプリパスワードを再生成してみてください",
-                                multiline=True,
-                                read_only=True,
-                                min_lines=10,
-                                max_lines=15,
-                                text_size=12,
-                                text_style=ft.TextStyle(color=ft.colors.BLACK),
-                                border=ft.InputBorder.OUTLINE,
-                                border_color=ft.colors.GREY_400,
-                                bgcolor=ft.colors.GREY_100,
-                                width=500,
-                                border_radius=8,
-                            )
-                        ])
-                    ),
-                    
-                    # コピーボタン
-                    ft.ElevatedButton(
-                        "説明をクリップボードにコピー",
-                        icon=ft.icons.COPY,
-                        on_click=self._copy_instruction_text
-                    )
-                ]),
-                padding=20
-            )
-        )
-        
-        # すべての設定項目をリストビューに配置
-        settings_items = [
-            email_settings,
-            ft.Text("※バッチ処理は1時間ごとに自動的に実行されます", 
-                   color=ft.colors.GREY, italic=True),
-            # 将来的に追加設定があればここに追加
-            ft.Container(height=20),  # 余白を追加
-        ]
-        
-        # スクロール可能なコンテナに配置
-        return ft.Container(
-            content=ft.ListView(
-                controls=settings_items,
-                spacing=10,
-                padding=10,
-                auto_scroll=True,
-                expand=True,
-            ),
-            padding=10,
-            expand=True
-        )
-        
+    
     def _toggle_simulation_mode(self, e):
         """シミュレーションモードの切り替え"""
         self.email_config["simulation_mode"] = self.simulation_mode_switch.value
@@ -2228,6 +1409,72 @@ class JobMonitorApp:
         """自動フォールバックの切り替え"""
         self.email_config["auto_fallback"] = self.auto_fallback_switch.value
         self._save_email_config()
+    
+    def _save_email_settings(self, e):
+        """
+        メール設定の保存
+        """
+        if self._validate_email_config():
+            self.email_config["enabled"] = True
+            self.email_config["gmail_address"] = self.gmail_address_field.value
+            self.email_config["recipient"] = self.gmail_address_field.value  # 送受信に同じアドレスを使用
+            self.email_config["gmail_app_password"] = self.gmail_app_password_field.value
+            
+            # シミュレーションモードを有効に
+            if "simulation_mode" not in self.email_config:
+                self.email_config["simulation_mode"] = True
+                self.simulation_mode_switch.value = True
+            
+            # 自動フォールバックを有効に
+            if "auto_fallback" not in self.email_config:
+                self.email_config["auto_fallback"] = True
+                self.auto_fallback_switch.value = True
+            
+            # 共通設定
+            self.email_config["subject_template"] = "クラウドワークスで{count}件の新着案件があります"
+            
+            self._save_email_config()
+            
+            if hasattr(self, "email_settings_view"):
+                self.email_settings_view.visible = False
+            
+            # シミュレーションモードが有効な場合はその旨を通知
+            if self.email_config.get("simulation_mode", True):
+                self._update_status(f"メール設定を保存しました（シミュレーションモード有効）", ft.colors.GREEN)
+                self._show_notification("シミュレーションモードが有効です。実際にメールは送信されません。", ft.colors.BLUE)
+            else:
+                self._update_status(f"メール設定を保存しました", ft.colors.GREEN)
+            
+            # ボタンの状態を更新
+            self._update_operation_buttons_state()
+            
+            # メール設定後に自動更新を開始するフラグがある場合
+            if hasattr(self, "_start_after_mail_setting") and self._start_after_mail_setting:
+                self._start_after_mail_setting = False
+                # 自動更新を開始
+                self._start_scheduler_ui_update()
+                threading.Thread(target=self._start_scheduler).start()
+            
+            self.page.update()
+        else:
+            self._update_status("メール設定を入力してください", ft.colors.RED)
+    
+    def _send_test_email(self, e):
+        """テストメールを送信"""
+        try:
+            if not self._validate_email_config():
+                return
+            
+            self._send_email_notification(
+                subject="クラウドワークス新着案件モニター - テストメール",
+                jobs=[],
+                is_test=True
+            )
+            
+            self._show_notification("テストメールを送信しました")
+        except Exception as e:
+            logger.error(f"テストメール送信に失敗しました: {e}")
+            self._show_notification(f"テストメール送信に失敗しました: {str(e)}")
     
     def _copy_instruction_text(self, e):
         """説明テキストをクリップボードにコピー"""
@@ -2293,6 +1540,616 @@ class JobMonitorApp:
             if e.pixels > 10000:  # かなり下にスクロールした場合
                 e.control.scroll_to(offset=8000)
                 self.page.update()
+    
+    def _create_job_card(self, job: Dict[str, Any]) -> ft.Card:
+        """
+        仕事情報からカードを作成
+        
+        Args:
+            job: 仕事情報
+            
+        Returns:
+            作成されたカード
+        """
+        return create_job_card(
+            job, 
+            format_date,  # 日付フォーマット関数
+            format_payment_text,  # 支払い情報フォーマット関数
+            self._open_url  # URL開く関数
+        )
+        
+    def _display_jobs(self):
+        """
+        仕事情報をUIに表示（初期表示用）
+        
+        フィルタリングされた仕事情報を取得し、UI上に表示します。
+        仕事は公開日時の新しい順（降順）に並び替えられます。
+        """
+        try:
+            # 処理開始のログ
+            logger.info("案件表示処理を開始")
+            
+            # 全ての仕事を取得
+            all_jobs = self.storage.get_all_jobs()
+            logger.info(f"保存済みの仕事数: {len(all_jobs)}件")
+            
+            # 保存された仕事がない場合、初期表示としてクラウドワークスから取得を試みる
+            if not all_jobs:
+                logger.info("保存されている仕事がないため、クラウドワークスから取得を試みます")
+                try:
+                    # ステータス更新
+                    update_status(self.status_text, "クラウドワークスから最新データを取得中...", ft.colors.ORANGE, self.page)
+                    self.progress_container.visible = True
+                    self.page.update()
+                    
+                    # クラウドワークスから仕事情報を取得
+                    jobs = self.scraper.get_job_offers()
+                    logger.info(f"クラウドワークスから取得した仕事数: {len(jobs)}件")
+                    
+                    # 取得した仕事を保存
+                    self.storage.update_jobs(jobs)
+                    
+                    # 取得した仕事を表示する
+                    self._display_search_jobs(jobs)
+                    
+                    # 進捗表示を非表示に
+                    self.progress_container.visible = False
+                    self.page.update()
+                    
+                    # 処理完了
+                    logger.info("案件表示処理が完了しました")
+                    return
+                except Exception as e:
+                    logger.error(f"クラウドワークスからの仕事取得に失敗しました: {e}")
+                    # 進捗表示を非表示に
+                    self.progress_container.visible = False
+                    self.page.update()
+            
+            # フィルタリング
+            if not all_jobs:
+                logger.info("フィルタリング対象の仕事がありません")
+                # 案件がない場合のメッセージ
+                self.job_list.controls = []
+                self.job_list.controls.append(
+                    ft.Container(
+                        content=ft.Text("保存されている案件がありません。\n検索または更新ボタンをクリックして案件を取得してください。", 
+                            color=ft.colors.GREY, size=16, text_align=ft.TextAlign.CENTER),
+                        alignment=ft.alignment.center,
+                        padding=40,
+                        margin=ft.margin.only(top=50)
+                    )
+                )
+                update_status(self.status_text, "案件がありません。検索または更新してください", ft.colors.BLUE, self.page)
+                self.page.update()
+                logger.info("案件表示処理が完了しました")
+                return
+                
+            filtered_jobs = self._filter_jobs(all_jobs)
+            logger.info(f"フィルタリング後の仕事数: {len(filtered_jobs)}件")
+            
+            # 例外処理を追加して、日付のパースエラーでも処理が止まらないようにする
+            try:
+                # 日付の新しい順に並べ替え
+                filtered_jobs.sort(
+                    key=get_job_date_for_sorting,
+                    reverse=True  # 降順（新しい順）
+                )
+                logger.info("仕事の並べ替えが完了しました")
+            except Exception as e:
+                logger.error(f"仕事の並べ替え中にエラーが発生: {e}")
+                # 並べ替えに失敗してもプロセスを続行
+            
+            # UIの更新を開始
+            logger.info("UI更新処理を開始")
+            
+            # リストをクリア
+            self.job_list.controls.clear()
+            
+            # 進捗表示
+            job_count = len(filtered_jobs)
+            update_status(self.status_text, f"{job_count}件の案件を表示中...", ft.colors.BLUE, self.page)
+            
+            # 仕事カードを追加
+            for i, job in enumerate(filtered_jobs):
+                try:
+                    self.job_list.controls.append(self._create_job_card(job))
+                    # 10件ごとに進捗更新
+                    if (i + 1) % 10 == 0:
+                        update_status(self.status_text, f"{i + 1}/{job_count}件の案件を表示中...", ft.colors.BLUE, self.page)
+                        self.page.update()
+                except Exception as e:
+                    logger.error(f"カード作成中にエラーが発生しました: {e}, job_id: {job.get('id', 'unknown')}")
+                    # 1つのカードの作成に失敗しても、他のカードの処理を続行
+            
+            # 案件がない場合のメッセージ
+            if not filtered_jobs:
+                self.job_list.controls.append(
+                    ft.Container(
+                        content=ft.Text("条件に一致する案件がありません", color=ft.colors.GREY, size=16),
+                        alignment=ft.alignment.center,
+                        padding=40
+                    )
+                )
+            
+            # 完了ステータスの更新
+            update_status(self.status_text, f"{len(filtered_jobs)}件の案件を表示中", ft.colors.GREEN, self.page)
+            
+            # UIを更新
+            self.page.update()
+            logger.info("案件表示処理が完了しました")
+            
+        except Exception as e:
+            logger.error(f"案件表示中にエラーが発生しました: {e}")
+            show_notification(self.page, f"案件の表示に失敗しました: {str(e)}")
+            # エラーステータスに更新
+            update_status(self.status_text, f"表示エラー: {str(e)}", ft.colors.RED, self.page)
+    
+    def _display_search_jobs(self, jobs: List[Dict[str, Any]]):
+        """
+        検索結果の仕事情報をUIに表示
+        
+        Args:
+            jobs: クラウドワークスから直接取得した仕事情報
+        """
+        try:
+            # 処理開始のログ
+            logger.info("検索結果表示処理を開始")
+            logger.info(f"検索前の仕事数: {len(jobs)}件")
+            
+            # クラウドワークスから取得した件数を表示
+            update_status(self.status_text, f"クラウドワークスから取得した仕事数: {len(jobs)}件", ft.colors.BLUE, self.page)
+            
+            # 何も検索条件がない場合はすべて表示
+            if not self.filter_keywords and self.filter_days == 0 and self.min_price == 0 and self.max_price == 0:
+                filtered_jobs = jobs
+                logger.info("検索条件が指定されていないため、すべての結果を表示します")
+            else:
+                # フィルタリング
+                logger.info(f"フィルタリング開始: {len(jobs)}件の仕事, 条件: 日数={self.filter_days}, キーワード={self.filter_keywords}")
+                
+                # 日付フィルタリング（取得した日から指定日数以内）
+                filtered_jobs = []
+                if self.filter_days > 0:  # 日数が0の場合はフィルタリングしない
+                    for job in jobs:
+                        if is_within_days(job, self.filter_days):
+                            filtered_jobs.append(job)
+                    logger.info(f"日付フィルタリング後: {len(filtered_jobs)}件")
+                else:
+                    filtered_jobs = jobs
+                    logger.info("日付フィルタリングはスキップされました")
+                
+                # キーワードフィルタリング
+                if self.filter_keywords:
+                    # フィルタリング前の件数をログに記録
+                    jobs_before_keyword = len(filtered_jobs)
+                    filtered_jobs = self.scraper.search_jobs_by_keyword(filtered_jobs, self.filter_keywords)
+                    logger.info(f"キーワードフィルタリング後: {len(filtered_jobs)}/{jobs_before_keyword}件")
+                
+                # 料金フィルタリング
+                if self.min_price > 0 or self.max_price > 0:
+                    jobs_before_price = len(filtered_jobs)
+                    filtered_jobs = [
+                        job for job in filtered_jobs 
+                        if price_in_range(job, self.min_price, self.max_price)
+                    ]
+                    logger.info(f"料金フィルタリング後: {len(filtered_jobs)}/{jobs_before_price}件")
+            
+            logger.info(f"フィルタリング後の仕事数: {len(filtered_jobs)}件")
+            
+            # 例外処理を追加して、日付のパースエラーでも処理が止まらないようにする
+            try:
+                # 日付の新しい順に並べ替え
+                filtered_jobs.sort(
+                    key=get_job_date_for_sorting,
+                    reverse=True  # 降順（新しい順）
+                )
+                logger.info("仕事の並べ替えが完了しました")
+            except Exception as e:
+                logger.error(f"仕事の並べ替え中にエラーが発生: {e}", exc_info=True)
+            
+            # 表示の更新
+            self.job_list.controls = []
+            
+            if not filtered_jobs:
+                # 検索結果が0件の場合のメッセージを表示
+                self.job_list.controls.append(
+                    ft.Container(
+                        content=ft.Text(
+                            "検索条件に一致する案件は見つかりませんでした。\n条件を変更して再度検索してください。",
+                            size=16,
+                            text_align=ft.TextAlign.CENTER,
+                            color=ft.colors.GREY
+                        ),
+                        margin=ft.margin.only(top=50),
+                        alignment=ft.alignment.center
+                    )
+                )
+                update_status(self.status_text, "検索条件に一致する案件は見つかりませんでした", ft.colors.ORANGE, self.page)
+            else:
+                logger.info("UI更新処理を開始")
+                for job in filtered_jobs:
+                    self.job_list.controls.append(self._create_job_card(job))
+                update_status(self.status_text, f"{len(filtered_jobs)}件の案件が見つかりました", ft.colors.GREEN, self.page)
+            
+            self.page.update()
+            logger.info("案件表示処理が完了しました")
+            
+        except Exception as e:
+            logger.error(f"案件表示処理中にエラーが発生: {e}", exc_info=True)
+    
+    def _handle_search_click(self, e):
+        """検索ボタンがクリックされたときの処理"""
+        # 検索条件を更新
+        keywords_text = self.search_field.value.strip() if self.search_field.value else ""
+        self.filter_keywords = [kw.strip() for kw in keywords_text.split(",")] if keywords_text else []
+        # 空の文字列を削除
+        self.filter_keywords = [kw for kw in self.filter_keywords if kw]
+        
+        try:
+            self.filter_days = int(self.days_dropdown.value) if self.days_dropdown.value else 0
+        except (ValueError, TypeError):
+            self.filter_days = 0
+            self.days_dropdown.value = "0"
+            
+        self.notification_enabled = self.notification_switch.value
+        
+        # 料金範囲の取得
+        try:
+            self.min_price = int(self.min_price_field.value) if self.min_price_field.value else 0
+        except ValueError:
+            self.min_price = 0
+            self.min_price_field.value = ""
+            
+        try:
+            self.max_price = int(self.max_price_field.value) if self.max_price_field.value else 0
+        except ValueError:
+            self.max_price = 0
+            self.max_price_field.value = ""
+        
+        logger.info(f"検索条件を更新: キーワード={self.filter_keywords}, 日数={self.filter_days}, 料金範囲={self.min_price}〜{self.max_price}")
+        
+        # 中断フラグをリセット
+        self.is_search_cancelled = False
+        
+        # ボタンの表示状態を更新
+        self.search_button.visible = False
+        self.search_cancel_button.visible = True
+        self.refresh_button.disabled = True
+        self.start_button.disabled = True
+        
+        # 進捗表示
+        self.progress_container.visible = True
+        self._update_status("クラウドワークスから最新データを取得中...", ft.colors.ORANGE)
+        self.page.update()
+        
+        # 非同期でクラウドワークスからデータを取得
+        threading.Thread(target=self._fetch_search_jobs).start()
+    
+    def _fetch_search_jobs(self):
+        """クラウドワークスから検索条件に合致する案件を取得"""
+        try:
+            # エラー発生時の処理を先に定義
+            def update_error():
+                self.progress_container.visible = False
+                self._update_status("検索中にエラーが発生しました", ft.colors.RED)
+                self._reset_search_buttons()
+                self.page.update()
+            
+            def update_progress(message):
+                def update():
+                    if not self.is_search_cancelled:  # 中断されていない場合のみ更新
+                        self.status_text.value = message
+                        self.page.update()
+                self._queue_ui_update(update)
+            
+            update_progress("検索処理を開始しています...")
+            
+            # 中断されていないか確認
+            if self.is_search_cancelled:
+                logger.info("検索処理が中断されました")
+                self._reset_search_buttons()
+                return
+                
+            update_progress("クラウドワークスに接続中...")
+            
+            # 中断チェックポイント
+            if self.is_search_cancelled:
+                logger.info("検索処理が中断されました")
+                self._reset_search_buttons()
+                return
+                
+            # キーワードフィルタリング
+            keyword_str = ",".join(self.filter_keywords) if self.filter_keywords else ""
+            
+            update_progress(f"キーワード '{keyword_str}' で検索中...")
+            
+            # スクレイパーで仕事情報を取得
+            jobs = self.scraper.get_job_offers()
+            
+            # ログに取得した仕事数を出力
+            logger.info(f"クラウドワークスから取得した仕事数: {len(jobs)}件")
+            
+            # 取得した仕事情報をJSON形式で保存する（検索のたびに更新）
+            self.storage.update_jobs(jobs)
+            
+            # 中断されていないか確認
+            if self.is_search_cancelled:
+                logger.info("検索処理が中断されました")
+                self._reset_search_buttons()
+                return
+            
+            # 取得した仕事数が50件の場合、JSON内容を表示する
+            show_json_data = len(jobs) == 50
+            
+            def update_search_result():
+                # プログレスインジケーターを非表示に
+                self.progress_container.visible = False
+                
+                # 結果を表示
+                if not jobs:
+                    self._update_status("検索条件に合致する案件は見つかりませんでした", ft.colors.ORANGE)
+                else:
+                    # 取得件数が50件の場合はJSON表示を有効にする
+                    self._display_search_jobs(jobs, show_json_data)
+                    self._update_status(f"{len(jobs)}件の案件が見つかりました", ft.colors.GREEN)
+                
+                # ボタンの状態を元に戻す
+                self._reset_search_buttons()
+                self.page.update()
+            
+            # 結果更新処理をキューに追加
+            self._queue_ui_update(update_search_result)
+            
+        except Exception as e:
+            logger.error(f"検索処理中にエラーが発生しました: {e}", exc_info=True)
+            # ここでupdate_errorがスコープ内にあることを確認
+            try:
+                self._queue_ui_update(update_error)
+            except Exception as inner_e:
+                logger.error(f"エラー処理中に二次的なエラーが発生しました: {inner_e}", exc_info=True)
+                def emergency_reset():
+                    self.progress_container.visible = False
+                    self._update_status("検索中に重大なエラーが発生しました", ft.colors.RED)
+                    self._reset_search_buttons()
+                    self.page.update()
+                self._queue_ui_update(emergency_reset)
+    
+    def _display_search_jobs(self, jobs: List[Dict[str, Any]], show_json_data: bool = False):
+        """
+        検索結果の仕事情報をUIに表示
+        
+        Args:
+            jobs: クラウドワークスから直接取得した仕事情報
+            show_json_data: 取得した仕事情報をJSON形式で表示するかどうか
+        """
+        try:
+            # 処理開始のログ
+            logger.info("検索結果表示処理を開始")
+            logger.info(f"検索前の仕事数: {len(jobs)}件")
+            
+            # クラウドワークスから取得した件数を表示
+            update_status(self.status_text, f"クラウドワークスから取得した仕事数: {len(jobs)}件", ft.colors.BLUE, self.page)
+            
+            # 何も検索条件がない場合はすべて表示
+            if not self.filter_keywords and self.filter_days == 0 and self.min_price == 0 and self.max_price == 0:
+                filtered_jobs = jobs
+                logger.info("検索条件が指定されていないため、すべての結果を表示します")
+            else:
+                # フィルタリング
+                logger.info(f"フィルタリング開始: {len(jobs)}件の仕事, 条件: 日数={self.filter_days}, キーワード={self.filter_keywords}")
+                
+                # 日付フィルタリング（取得した日から指定日数以内）
+                filtered_jobs = []
+                if self.filter_days > 0:  # 日数が0の場合はフィルタリングしない
+                    for job in jobs:
+                        if is_within_days(job, self.filter_days):
+                            filtered_jobs.append(job)
+                    logger.info(f"日付フィルタリング後: {len(filtered_jobs)}件")
+                else:
+                    filtered_jobs = jobs
+                    logger.info("日付フィルタリングはスキップされました")
+                
+                # キーワードフィルタリング
+                if self.filter_keywords:
+                    # フィルタリング前の件数をログに記録
+                    jobs_before_keyword = len(filtered_jobs)
+                    filtered_jobs = self.scraper.search_jobs_by_keyword(filtered_jobs, self.filter_keywords)
+                    logger.info(f"キーワードフィルタリング後: {len(filtered_jobs)}/{jobs_before_keyword}件")
+                
+                # 料金フィルタリング
+                if self.min_price > 0 or self.max_price > 0:
+                    jobs_before_price = len(filtered_jobs)
+                    filtered_jobs = [
+                        job for job in filtered_jobs 
+                        if price_in_range(job, self.min_price, self.max_price)
+                    ]
+                    logger.info(f"料金フィルタリング後: {len(filtered_jobs)}/{jobs_before_price}件")
+            
+            logger.info(f"フィルタリング後の仕事数: {len(filtered_jobs)}件")
+            
+            # 例外処理を追加して、日付のパースエラーでも処理が止まらないようにする
+            try:
+                # 日付の新しい順に並べ替え
+                filtered_jobs.sort(
+                    key=get_job_date_for_sorting,
+                    reverse=True  # 降順（新しい順）
+                )
+                logger.info("仕事の並べ替えが完了しました")
+            except Exception as e:
+                logger.error(f"仕事の並べ替え中にエラーが発生: {e}", exc_info=True)
+            
+            # 表示の更新
+            self.job_list.controls = []
+            
+            if not filtered_jobs:
+                # 検索結果が0件の場合のメッセージを表示
+                self.job_list.controls.append(
+                    ft.Container(
+                        content=ft.Text(
+                            "検索条件に一致する案件は見つかりませんでした。\n条件を変更して再度検索してください。",
+                            size=16,
+                            text_align=ft.TextAlign.CENTER,
+                            color=ft.colors.GREY
+                        ),
+                        margin=ft.margin.only(top=50),
+                        alignment=ft.alignment.center
+                    )
+                )
+                update_status(self.status_text, "検索条件に一致する案件は見つかりませんでした", ft.colors.ORANGE, self.page)
+            else:
+                logger.info("UI更新処理を開始")
+                for job in filtered_jobs:
+                    self.job_list.controls.append(self._create_job_card(job))
+                update_status(self.status_text, f"{len(filtered_jobs)}件の案件が見つかりました", ft.colors.GREEN, self.page)
+            
+            self.page.update()
+            logger.info("案件表示処理が完了しました")
+            
+            # 取得した仕事情報をJSON形式で表示する
+            if show_json_data:
+                self._show_json_data(jobs)
+            
+        except Exception as e:
+            logger.error(f"案件表示処理中にエラーが発生: {e}", exc_info=True)
+    
+    def _show_json_data(self, jobs: List[Dict[str, Any]]):
+        """
+        jobs_data.jsonファイルの内容を表示
+        
+        Args:
+            jobs: クラウドワークスから直接取得した仕事情報（参照用・表示には使用しない）
+        """
+        try:
+            # jobs_data.jsonファイルの内容を読み込む
+            with open(self.storage.storage_file, "r", encoding="utf-8") as f:
+                file_content = f.read()
+            
+            # JSON形式で表示するためのウィジェット
+            json_display = ft.TextField(
+                value=file_content,
+                multiline=True,
+                read_only=True,
+                min_lines=15,
+                max_lines=25,
+                text_size=12,
+                width=800,
+                height=500,
+                border=ft.InputBorder.OUTLINE,
+                bgcolor=ft.colors.BLUE_GREY_50,
+            )
+            
+            # 保存場所を表示するテキスト
+            storage_path = os.path.abspath(self.storage.storage_file)
+            path_text = ft.Text(f"ファイル保存場所: {storage_path}", size=14, color=ft.colors.BLUE_700)
+            
+            # 取得件数を表示するテキスト
+            count_text = ft.Text(f"取得した仕事情報: {len(jobs)}件", size=16, weight=ft.FontWeight.BOLD)
+            
+            # ダイアログを作成
+            dialog = ft.AlertDialog(
+                title=ft.Text("jobs_data.json の内容", size=20, weight=ft.FontWeight.BOLD),
+                content=ft.Column(
+                    [
+                        count_text,
+                        path_text,
+                        ft.Divider(),
+                        ft.Text("JSONデータ:", size=14),
+                        ft.Container(
+                            content=json_display,
+                            padding=10,
+                        )
+                    ],
+                    scroll=ft.ScrollMode.AUTO,
+                    spacing=10,
+                    height=600,
+                ),
+                actions=[
+                    ft.ElevatedButton(
+                        "ファイルを開く", 
+                        icon=ft.icons.FOLDER_OPEN,
+                        on_click=lambda e: self._open_json_file(e)
+                    ),
+                    ft.TextButton("閉じる", on_click=lambda e: self._close_json_dialog(e))
+                ],
+                actions_alignment=ft.MainAxisAlignment.END,
+            )
+            
+            # ダイアログを表示
+            self.page.dialog = dialog
+            self.page.dialog.open = True
+            self.page.update()
+            
+            # ログにも記録
+            logger.info(f"jobs_data.jsonの内容を表示しました（{len(jobs)}件の仕事情報）")
+            
+        except Exception as e:
+            logger.error(f"jobs_data.jsonの内容を表示する際にエラーが発生しました: {e}")
+            self._show_notification(f"jobs_data.jsonの内容を表示できませんでした: {str(e)}", ft.colors.RED)
+    
+    def _open_json_file(self, e):
+        """
+        jobs_data.jsonファイルをエクスプローラーで開く
+        
+        Args:
+            e: イベントオブジェクト
+        """
+        try:
+            file_path = os.path.abspath(self.storage.storage_file)
+            
+            # ファイルが存在するか確認
+            if not os.path.exists(file_path):
+                self._show_notification(f"ファイルが見つかりません: {file_path}", ft.colors.RED)
+                return
+                
+            # OSに応じてファイルを開く
+            if sys.platform == 'win32':
+                os.startfile(file_path)
+            elif sys.platform == 'darwin':  # macOS
+                subprocess.call(['open', file_path])
+            else:  # Linux系
+                subprocess.call(['xdg-open', file_path])
+                
+            self._show_notification(f"jobs_data.jsonファイルを開きました", ft.colors.GREEN)
+            
+        except Exception as e:
+            logger.error(f"ファイルを開く際にエラーが発生しました: {e}")
+            self._show_notification(f"ファイルを開けませんでした: {str(e)}", ft.colors.RED)
+    
+    def _show_json_button_click(self, e):
+        """
+        JSON表示ボタンのクリックハンドラ
+        
+        Args:
+            e: イベントオブジェクト
+        """
+        try:
+            # JSONファイルが存在するか確認
+            if not os.path.exists(self.storage.storage_file):
+                self._show_notification("jobs_data.jsonファイルが見つかりません。検索を実行してデータを取得してください。", ft.colors.AMBER)
+                return
+                
+            # ファイルから仕事情報を読み込む
+            jobs = self.storage.get_all_jobs()
+            
+            # jobs_data.jsonの内容を表示
+            if jobs:
+                self._show_json_data(jobs)
+            else:
+                self._show_notification("仕事情報がありません。検索を実行してデータを取得してください。", ft.colors.AMBER)
+        except Exception as e:
+            logger.error(f"JSONデータ表示中にエラーが発生しました: {e}")
+            self._show_notification(f"JSONデータを表示できませんでした: {str(e)}", ft.colors.RED)
+    
+    def _close_json_dialog(self, e):
+        """
+        JSONデータを表示するダイアログを閉じる
+        
+        Args:
+            e: イベントオブジェクト
+        """
+        if hasattr(self, "page") and self.page and hasattr(self.page, "dialog"):
+            self.page.dialog.open = False
+            self.page.update()
 
 def main(page: ft.Page):
     """アプリケーションのエントリーポイント"""

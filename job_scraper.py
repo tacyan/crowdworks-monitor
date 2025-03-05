@@ -173,11 +173,17 @@ class CrowdworksJobScraper:
         filtered_jobs = []
         for job in jobs:
             for keyword in keywords:
-                if (keyword.lower() in job['title'].lower() or 
-                    keyword.lower() in job['description'].lower()):
+                keyword = keyword.lower().strip()
+                if not keyword:  # 空のキーワードはスキップ
+                    continue
+                    
+                # タイトルと説明文の両方で検索
+                if (keyword in job['title'].lower() or 
+                    keyword in job['description'].lower()):
                     filtered_jobs.append(job)
-                    break
-        
+                    break  # 1つのキーワードが一致したら、この仕事を追加して次の仕事へ
+                    
+        logger.info(f"キーワード検索結果: {len(filtered_jobs)}/{len(jobs)}件が一致")
         return filtered_jobs
 
 # 単体テスト用のコード
