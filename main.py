@@ -555,7 +555,7 @@ class JobMonitorApp:
                     self.stop_button,
                     # JSONデータ表示ボタンを追加
                     ft.ElevatedButton(
-                        text="JSON表示",
+                        text="JSON形式表示",
                         icon=ft.icons.DATA_OBJECT,
                         on_click=self._show_json_button_click,
                         style=ft.ButtonStyle(
@@ -1684,16 +1684,42 @@ class JobMonitorApp:
             # エラーステータスに更新
             update_status(self.status_text, f"表示エラー: {str(e)}", ft.colors.RED, self.page)
     
-    def _display_search_jobs(self, jobs: List[Dict[str, Any]]):
+    def _display_search_jobs(self, jobs: List[Dict[str, Any]], show_json_data: bool = False):
         """
         検索結果の仕事情報をUIに表示
         
         Args:
             jobs: クラウドワークスから直接取得した仕事情報
+            show_json_data: 取得した仕事情報をJSON形式で表示するかどうか
         """
         try:
             # 処理開始のログ
             logger.info("検索結果表示処理を開始")
+            
+            # show_json_dataフラグが有効の場合、jobs_data.jsonから直接データを読み込んで表示
+            if show_json_data:
+                logger.info("jobs_data.jsonから直接データを読み込みます")
+                storage_jobs = self.storage.get_all_jobs()
+                if storage_jobs:
+                    logger.info(f"jobs_data.jsonから{len(storage_jobs)}件の仕事情報を読み込みました")
+                    
+                    # 表示の更新
+                    self.job_list.controls = []
+                    
+                    # 各案件の情報を表示
+                    for job in storage_jobs:
+                        self.job_list.controls.append(self._create_json_card(job))
+                    
+                    # 完了ステータスの更新
+                    update_status(self.status_text, f"jobs_data.jsonから{len(storage_jobs)}件の案件を表示中", ft.colors.GREEN, self.page)
+                    self.page.update()
+                    logger.info("jobs_data.jsonからの案件表示処理が完了しました")
+                    return
+                else:
+                    logger.warning("jobs_data.jsonにデータがありません")
+                    self._show_notification("jobs_data.jsonにデータがありません", ft.colors.AMBER)
+            
+            # 通常の検索処理
             logger.info(f"検索前の仕事数: {len(jobs)}件")
             
             # クラウドワークスから取得した件数を表示
@@ -1776,6 +1802,96 @@ class JobMonitorApp:
             
         except Exception as e:
             logger.error(f"案件表示処理中にエラーが発生: {e}", exc_info=True)
+    
+    def _create_json_card(self, job: Dict[str, Any]) -> ft.Card:
+        """
+        JSON形式の仕事情報からカードを作成
+        
+        Args:
+            job: JSON形式の仕事情報
+            
+        Returns:
+            作成されたカード
+        """
+        try:
+            # 必要な情報を取得
+            title = job.get('title', '不明')
+            url = job.get('url', '#')
+            description = job.get('description', '説明なし')
+            category_id = job.get('category_id', '')
+            expired_on = job.get('expired_on', '不明')
+            last_released_at = job.get('last_released_at', '不明')
+            payment_info = job.get('payment_info', '')
+            client_name = job.get('client_name', '不明')
+            is_employer_certification = job.get('is_employer_certification', False)
+            
+            # 各情報を表示するテキスト
+            info_texts = [
+                ft.Text(f"タイトル: {title}", size=16, weight=ft.FontWeight.BOLD, color=ft.colors.INDIGO_800),
+                ft.Text(f"URL: {url}", size=14, color=ft.colors.BLUE, selectable=True),
+                ft.Text(f"説明: {description[:150]}...", size=14, color=ft.colors.BLACK87),
+                ft.Text(f"カテゴリID: {category_id}", size=14, color=ft.colors.GREY_700),
+                ft.Text(f"掲載期限: {expired_on}", size=14, color=ft.colors.GREY_700),
+                ft.Text(f"最終更新日時: {last_released_at}", size=14, color=ft.colors.GREY_700),
+                ft.Text(f"報酬情報: {payment_info}", size=14, color=ft.colors.ORANGE_700),
+                ft.Text(f"クライアント名: {client_name}", size=14, color=ft.colors.GREY_700),
+                ft.Text(f"認証事業者: {'はい' if is_employer_certification else 'いいえ'}", size=14, color=ft.colors.GREY_700),
+            ]
+            
+            # カード
+            return ft.Card(
+                content=ft.Container(
+                    content=ft.Column(
+                        controls=[
+                            # ヘッダー
+                            ft.ListTile(
+                                title=ft.Text(title, size=16, weight=ft.FontWeight.BOLD),
+                                subtitle=ft.Text(f"クライアント: {client_name}", size=14),
+                                trailing=ft.Row(
+                                    [
+                                        ft.IconButton(
+                                            icon=ft.icons.OPEN_IN_NEW,
+                                            tooltip="ブラウザで開く",
+                                            on_click=lambda e, u=url: self._open_url(u)
+                                        ),
+                                        ft.IconButton(
+                                            icon=ft.icons.FOLDER_OPEN,
+                                            tooltip="JSONファイルを開く",
+                                            on_click=lambda e: self._open_json_file(e)
+                                        )
+                                    ],
+                                    spacing=0,
+                                    width=100
+                                )
+                            ),
+                            # 区切り線
+                            ft.Divider(),
+                            # JSON情報
+                            ft.Container(
+                                content=ft.Column(
+                                    controls=info_texts,
+                                    spacing=6
+                                ),
+                                padding=ft.padding.all(16)
+                            )
+                        ],
+                        spacing=0
+                    ),
+                    padding=ft.padding.only(bottom=10)
+                ),
+                elevation=2,
+                margin=ft.margin.only(bottom=10),
+                color=ft.colors.BLUE_GREY_50
+            )
+        except Exception as e:
+            logger.error(f"JSONカード作成中にエラーが発生しました: {e}")
+            # エラー時は簡易カードを返す
+            return ft.Card(
+                content=ft.Container(
+                    content=ft.Text(f"案件データの表示に失敗しました: {str(e)}", color=ft.colors.RED),
+                    padding=10
+                )
+            )
     
     def _handle_search_click(self, e):
         """検索ボタンがクリックされたときの処理"""
@@ -1878,7 +1994,7 @@ class JobMonitorApp:
                 self._reset_search_buttons()
                 return
             
-            # 取得した仕事数が50件の場合、JSON内容を表示する
+            # 取得した仕事数が50件の場合、JSON表示を有効にする
             show_json_data = len(jobs) == 50
             
             def update_search_result():
@@ -1891,7 +2007,10 @@ class JobMonitorApp:
                 else:
                     # 取得件数が50件の場合はJSON表示を有効にする
                     self._display_search_jobs(jobs, show_json_data)
-                    self._update_status(f"{len(jobs)}件の案件が見つかりました", ft.colors.GREEN)
+                    if show_json_data:
+                        self._update_status(f"jobs_data.jsonから{len(jobs)}件の案件を表示しています", ft.colors.GREEN)
+                    else:
+                        self._update_status(f"{len(jobs)}件の案件が見つかりました", ft.colors.GREEN)
                 
                 # ボタンの状態を元に戻す
                 self._reset_search_buttons()
@@ -1914,103 +2033,61 @@ class JobMonitorApp:
                     self.page.update()
                 self._queue_ui_update(emergency_reset)
     
-    def _display_search_jobs(self, jobs: List[Dict[str, Any]], show_json_data: bool = False):
+    def _show_json_button_click(self, e):
         """
-        検索結果の仕事情報をUIに表示
+        JSON表示ボタンのクリックハンドラ
         
         Args:
-            jobs: クラウドワークスから直接取得した仕事情報
-            show_json_data: 取得した仕事情報をJSON形式で表示するかどうか
+            e: イベントオブジェクト
         """
         try:
-            # 処理開始のログ
-            logger.info("検索結果表示処理を開始")
-            logger.info(f"検索前の仕事数: {len(jobs)}件")
+            # JSONファイルが存在するか確認
+            if not os.path.exists(self.storage.storage_file):
+                self._show_notification("jobs_data.jsonファイルが見つかりません。検索を実行してデータを取得してください。", ft.colors.AMBER)
+                return
+                
+            # ファイルから仕事情報を読み込む
+            jobs = self.storage.get_all_jobs()
             
-            # クラウドワークスから取得した件数を表示
-            update_status(self.status_text, f"クラウドワークスから取得した仕事数: {len(jobs)}件", ft.colors.BLUE, self.page)
-            
-            # 何も検索条件がない場合はすべて表示
-            if not self.filter_keywords and self.filter_days == 0 and self.min_price == 0 and self.max_price == 0:
-                filtered_jobs = jobs
-                logger.info("検索条件が指定されていないため、すべての結果を表示します")
+            # jobs_data.jsonの内容を表示
+            if jobs:
+                # ダイアログではなく、案件一覧に直接表示
+                self._display_search_jobs(jobs, show_json_data=True)
+                self._show_notification(f"jobs_data.jsonから{len(jobs)}件の案件を表示しました", ft.colors.GREEN)
             else:
-                # フィルタリング
-                logger.info(f"フィルタリング開始: {len(jobs)}件の仕事, 条件: 日数={self.filter_days}, キーワード={self.filter_keywords}")
+                self._show_notification("仕事情報がありません。検索を実行してデータを取得してください。", ft.colors.AMBER)
+        except Exception as e:
+            logger.error(f"JSONデータ表示中にエラーが発生しました: {e}")
+            self._show_notification(f"JSONデータを表示できませんでした: {str(e)}", ft.colors.RED)
+    
+    def _open_json_file(self, e):
+        """
+        jobs_data.jsonファイルをエクスプローラーで開く
+        
+        Args:
+            e: イベントオブジェクト
+        """
+        try:
+            file_path = os.path.abspath(self.storage.storage_file)
+            
+            # ファイルが存在するか確認
+            if not os.path.exists(file_path):
+                self._show_notification(f"ファイルが見つかりません: {file_path}", ft.colors.RED)
+                return
                 
-                # 日付フィルタリング（取得した日から指定日数以内）
-                filtered_jobs = []
-                if self.filter_days > 0:  # 日数が0の場合はフィルタリングしない
-                    for job in jobs:
-                        if is_within_days(job, self.filter_days):
-                            filtered_jobs.append(job)
-                    logger.info(f"日付フィルタリング後: {len(filtered_jobs)}件")
-                else:
-                    filtered_jobs = jobs
-                    logger.info("日付フィルタリングはスキップされました")
+            # OSに応じてファイルを開く
+            if sys.platform == 'win32':
+                os.startfile(file_path)
+            elif sys.platform == 'darwin':  # macOS
+                subprocess.call(['open', file_path])
+            else:  # Linux系
+                subprocess.call(['xdg-open', file_path])
                 
-                # キーワードフィルタリング
-                if self.filter_keywords:
-                    # フィルタリング前の件数をログに記録
-                    jobs_before_keyword = len(filtered_jobs)
-                    filtered_jobs = self.scraper.search_jobs_by_keyword(filtered_jobs, self.filter_keywords)
-                    logger.info(f"キーワードフィルタリング後: {len(filtered_jobs)}/{jobs_before_keyword}件")
-                
-                # 料金フィルタリング
-                if self.min_price > 0 or self.max_price > 0:
-                    jobs_before_price = len(filtered_jobs)
-                    filtered_jobs = [
-                        job for job in filtered_jobs 
-                        if price_in_range(job, self.min_price, self.max_price)
-                    ]
-                    logger.info(f"料金フィルタリング後: {len(filtered_jobs)}/{jobs_before_price}件")
-            
-            logger.info(f"フィルタリング後の仕事数: {len(filtered_jobs)}件")
-            
-            # 例外処理を追加して、日付のパースエラーでも処理が止まらないようにする
-            try:
-                # 日付の新しい順に並べ替え
-                filtered_jobs.sort(
-                    key=get_job_date_for_sorting,
-                    reverse=True  # 降順（新しい順）
-                )
-                logger.info("仕事の並べ替えが完了しました")
-            except Exception as e:
-                logger.error(f"仕事の並べ替え中にエラーが発生: {e}", exc_info=True)
-            
-            # 表示の更新
-            self.job_list.controls = []
-            
-            if not filtered_jobs:
-                # 検索結果が0件の場合のメッセージを表示
-                self.job_list.controls.append(
-                    ft.Container(
-                        content=ft.Text(
-                            "検索条件に一致する案件は見つかりませんでした。\n条件を変更して再度検索してください。",
-                            size=16,
-                            text_align=ft.TextAlign.CENTER,
-                            color=ft.colors.GREY
-                        ),
-                        margin=ft.margin.only(top=50),
-                        alignment=ft.alignment.center
-                    )
-                )
-                update_status(self.status_text, "検索条件に一致する案件は見つかりませんでした", ft.colors.ORANGE, self.page)
-            else:
-                logger.info("UI更新処理を開始")
-                for job in filtered_jobs:
-                    self.job_list.controls.append(self._create_job_card(job))
-                update_status(self.status_text, f"{len(filtered_jobs)}件の案件が見つかりました", ft.colors.GREEN, self.page)
-            
-            self.page.update()
-            logger.info("案件表示処理が完了しました")
-            
-            # 取得した仕事情報をJSON形式で表示する
-            if show_json_data:
-                self._show_json_data(jobs)
+            self._show_notification(f"jobs_data.jsonファイルを開きました", ft.colors.GREEN)
             
         except Exception as e:
-            logger.error(f"案件表示処理中にエラーが発生: {e}", exc_info=True)
+            logger.error(f"ファイルを開く際にエラーが発生しました: {e}")
+            self._show_notification(f"ファイルを開けませんでした: {str(e)}", ft.colors.RED)
     
     def _show_json_data(self, jobs: List[Dict[str, Any]]):
         """
@@ -2085,60 +2162,6 @@ class JobMonitorApp:
         except Exception as e:
             logger.error(f"jobs_data.jsonの内容を表示する際にエラーが発生しました: {e}")
             self._show_notification(f"jobs_data.jsonの内容を表示できませんでした: {str(e)}", ft.colors.RED)
-    
-    def _open_json_file(self, e):
-        """
-        jobs_data.jsonファイルをエクスプローラーで開く
-        
-        Args:
-            e: イベントオブジェクト
-        """
-        try:
-            file_path = os.path.abspath(self.storage.storage_file)
-            
-            # ファイルが存在するか確認
-            if not os.path.exists(file_path):
-                self._show_notification(f"ファイルが見つかりません: {file_path}", ft.colors.RED)
-                return
-                
-            # OSに応じてファイルを開く
-            if sys.platform == 'win32':
-                os.startfile(file_path)
-            elif sys.platform == 'darwin':  # macOS
-                subprocess.call(['open', file_path])
-            else:  # Linux系
-                subprocess.call(['xdg-open', file_path])
-                
-            self._show_notification(f"jobs_data.jsonファイルを開きました", ft.colors.GREEN)
-            
-        except Exception as e:
-            logger.error(f"ファイルを開く際にエラーが発生しました: {e}")
-            self._show_notification(f"ファイルを開けませんでした: {str(e)}", ft.colors.RED)
-    
-    def _show_json_button_click(self, e):
-        """
-        JSON表示ボタンのクリックハンドラ
-        
-        Args:
-            e: イベントオブジェクト
-        """
-        try:
-            # JSONファイルが存在するか確認
-            if not os.path.exists(self.storage.storage_file):
-                self._show_notification("jobs_data.jsonファイルが見つかりません。検索を実行してデータを取得してください。", ft.colors.AMBER)
-                return
-                
-            # ファイルから仕事情報を読み込む
-            jobs = self.storage.get_all_jobs()
-            
-            # jobs_data.jsonの内容を表示
-            if jobs:
-                self._show_json_data(jobs)
-            else:
-                self._show_notification("仕事情報がありません。検索を実行してデータを取得してください。", ft.colors.AMBER)
-        except Exception as e:
-            logger.error(f"JSONデータ表示中にエラーが発生しました: {e}")
-            self._show_notification(f"JSONデータを表示できませんでした: {str(e)}", ft.colors.RED)
     
     def _close_json_dialog(self, e):
         """
