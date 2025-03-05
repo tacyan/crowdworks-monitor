@@ -171,19 +171,34 @@ class CrowdworksJobScraper:
             return jobs
         
         filtered_jobs = []
+        match_count = 0
+        
+        # デバッグ用にキーワードを出力
+        keywords_str = ', '.join(keywords)
+        logger.info(f"検索キーワード: {keywords_str}")
+        logger.info(f"検索対象の仕事数: {len(jobs)}件")
+        
         for job in jobs:
+            title = job['title']
+            description = job['description']
+            
+            # タイトルと説明文をデバッグログに出力
+            logger.debug(f"タイトル: {title}")
+            logger.debug(f"説明文: {description}")
+            
             for keyword in keywords:
-                keyword = keyword.lower().strip()
+                keyword = keyword.strip()
                 if not keyword:  # 空のキーワードはスキップ
                     continue
-                    
-                # タイトルと説明文の両方で検索
-                if (keyword in job['title'].lower() or 
-                    keyword in job['description'].lower()):
+                
+                # タイトルと説明文の両方で検索（大文字小文字を区別せず）
+                if (keyword in title or keyword in description):
                     filtered_jobs.append(job)
+                    match_count += 1
+                    logger.debug(f"一致: キーワード '{keyword}' が '{title}' に含まれています")
                     break  # 1つのキーワードが一致したら、この仕事を追加して次の仕事へ
-                    
-        logger.info(f"キーワード検索結果: {len(filtered_jobs)}/{len(jobs)}件が一致")
+        
+        logger.info(f"キーワード検索結果: {match_count}/{len(jobs)}件が一致")
         return filtered_jobs
 
 # 単体テスト用のコード

@@ -628,9 +628,67 @@ class JobMonitorApp:
         self.page.update()
     
     def _init_app(self):
-        """アプリケーションの初期化"""
+        """アプリケーションの初期化処理"""
+        # ロギング
+        logger.info("アプリケーションを初期化中...")
+        
+        # 保存済みのデータがあるか確認
+        existing_jobs = self.storage.get_all_jobs()
+        
+        # jobs_data.jsonが空の場合はサンプルデータを作成
+        if not existing_jobs and self.email_config.get("simulation_mode", False):
+            logger.info("シミュレーションモードでサンプルデータを作成します")
+            sample_jobs = [
+                {
+                    'id': 12345,
+                    'title': '【Pythonプログラマー募集】Webスクレイピングプロジェクト',
+                    'url': 'https://crowdworks.jp/public/jobs/12345',
+                    'description': 'Pythonを使ったWebスクレイピングプロジェクトを担当していただける方を募集します。データ分析の知識があると尚良いです。',
+                    'category_id': 17,
+                    'expired_on': '2025-04-01',
+                    'last_released_at': '2025-03-05T12:00:00+09:00',
+                    'payment_info': '50000.0円 〜 100000.0円',
+                    'client_name': 'テスト依頼者',
+                    'is_employer_certification': True
+                },
+                {
+                    'id': 67890,
+                    'title': '【データ分析】機械学習を使った市場分析',
+                    'url': 'https://crowdworks.jp/public/jobs/67890',
+                    'description': 'データ分析の専門家を募集します。Pythonを用いた機械学習モデルの構築経験がある方歓迎です。',
+                    'category_id': 40,
+                    'expired_on': '2025-04-15',
+                    'last_released_at': '2025-03-06T15:30:00+09:00',
+                    'payment_info': '100000.0円 〜 200000.0円',
+                    'client_name': 'データサイエンス企業',
+                    'is_employer_certification': False
+                },
+                {
+                    'id': 54321,
+                    'title': 'Webアプリケーション開発者募集',
+                    'url': 'https://crowdworks.jp/public/jobs/54321',
+                    'description': 'Webアプリ開発プロジェクトのお手伝いをしていただける方を募集します。フロントエンド、バックエンド両方の経験がある方歓迎。',
+                    'category_id': 14,
+                    'expired_on': '2025-04-10',
+                    'last_released_at': '2025-03-07T09:15:00+09:00',
+                    'payment_info': '30000.0円 〜 80000.0円',
+                    'client_name': 'システム開発会社',
+                    'is_employer_certification': True
+                }
+            ]
+            # サンプルデータを保存
+            self.storage.update_jobs(sample_jobs)
+            logger.info(f"{len(sample_jobs)}件のサンプルデータを保存しました")
+        
+        # 仕事情報を初期化
+        self.storage.clear_jobs()
+        logger.info("仕事情報を初期化しました")
+        
         try:
             logging.info("アプリケーションを初期化中...")
+            
+            # アプリ起動時にデータを初期化
+            self.storage.clear_jobs()
             
             # タイトル
             title = ft.Text(
@@ -1587,11 +1645,21 @@ class JobMonitorApp:
                     jobs = self.scraper.get_job_offers()
                     logger.info(f"クラウドワークスから取得した仕事数: {len(jobs)}件")
                     
-                    # 取得した仕事を保存
+                    # 取得した仕事を保存（初期表示時もデータを上書き）
+                    self.storage.clear_jobs()
                     self.storage.update_jobs(jobs)
                     
                     # 取得した仕事を表示する
-                    self._display_search_jobs(jobs)
+                    storage_jobs = self.storage.get_all_jobs()
+                    
+                    # 事前にカードリストを作成
+                    job_cards = []
+                    for job in storage_jobs:
+                        job_cards.append(self._create_json_card(job))
+                        
+                    # 一度に追加して更新
+                    self.job_list.controls = job_cards
+                    update_status(self.status_text, f"jobs_data.jsonから{len(storage_jobs)}件の案件を表示中", ft.colors.GREEN, self.page)
                     
                     # 進捗表示を非表示に
                     self.progress_container.visible = False
@@ -1970,8 +2038,58 @@ class JobMonitorApp:
             keyword_str = ",".join(self.filter_keywords) if self.filter_keywords else ""
             update_progress(f"キーワード '{keyword_str}' で検索中...")
             
-            # スクレイパーで仕事情報を取得
-            jobs = self.scraper.get_job_offers()
+            # シミュレーションモードか確認
+            is_simulation = self.email_config.get("simulation_mode", False)
+            
+            if is_simulation:
+                # シミュレーションモードの場合はサンプルデータを使用
+                logger.info("シミュレーションモードで実行中")
+                jobs = self.storage.get_all_jobs()
+                
+                # サンプルデータがない場合はデモデータを作成
+                if not jobs:
+                    logger.info("サンプルデータが見つからないため、デモデータを作成します")
+                    jobs = [
+                        {
+                            'id': 12345,
+                            'title': '【Pythonプログラマー募集】Webスクレイピングプロジェクト',
+                            'url': 'https://crowdworks.jp/public/jobs/12345',
+                            'description': 'Pythonを使ったWebスクレイピングプロジェクトを担当していただける方を募集します。データ分析の知識があると尚良いです。',
+                            'category_id': 17,
+                            'expired_on': '2025-04-01',
+                            'last_released_at': '2025-03-05T12:00:00+09:00',
+                            'payment_info': '50000.0円 〜 100000.0円',
+                            'client_name': 'テスト依頼者',
+                            'is_employer_certification': True
+                        },
+                        {
+                            'id': 67890,
+                            'title': '【データ分析】機械学習を使った市場分析',
+                            'url': 'https://crowdworks.jp/public/jobs/67890',
+                            'description': 'データ分析の専門家を募集します。Pythonを用いた機械学習モデルの構築経験がある方歓迎です。',
+                            'category_id': 40,
+                            'expired_on': '2025-04-15',
+                            'last_released_at': '2025-03-06T15:30:00+09:00',
+                            'payment_info': '100000.0円 〜 200000.0円',
+                            'client_name': 'データサイエンス企業',
+                            'is_employer_certification': False
+                        },
+                        {
+                            'id': 54321,
+                            'title': 'Webアプリケーション開発者募集',
+                            'url': 'https://crowdworks.jp/public/jobs/54321',
+                            'description': 'Webアプリ開発プロジェクトのお手伝いをしていただける方を募集します。フロントエンド、バックエンド両方の経験がある方歓迎。',
+                            'category_id': 14,
+                            'expired_on': '2025-04-10',
+                            'last_released_at': '2025-03-07T09:15:00+09:00',
+                            'payment_info': '30000.0円 〜 80000.0円',
+                            'client_name': 'システム開発会社',
+                            'is_employer_certification': True
+                        }
+                    ]
+            else:
+                # 通常モードではスクレイパーで仕事情報を取得
+                jobs = self.scraper.get_job_offers()
             
             # ログに取得した仕事数を出力
             logger.info(f"クラウドワークスから取得した仕事数: {len(jobs)}件")
@@ -1981,6 +2099,26 @@ class JobMonitorApp:
                 logger.info("検索処理が中断されました")
                 self._reset_search_buttons()
                 return
+            
+            # キーワードによるフィルタリングを適用
+            if self.filter_keywords:
+                try:
+                    filtered_jobs = self.scraper.search_jobs_by_keyword(jobs, self.filter_keywords)
+                    logger.info(f"キーワードフィルタリング後の仕事数: {len(filtered_jobs)}件")
+                    jobs = filtered_jobs
+                except Exception as e:
+                    logger.error(f"キーワードフィルタリング中にエラーが発生しました: {e}")
+                    update_progress("キーワードフィルタリング中にエラーが発生しました")
+                    # エラーが発生しても元のjobsを使用してそのまま処理を続行
+            
+            # 結果が0件の場合にユーザーに通知
+            if len(jobs) == 0:
+                update_progress(f"キーワード '{keyword_str}' に一致する仕事が見つかりませんでした")
+                self._show_notification(f"キーワード '{keyword_str}' に一致する仕事はありません", ft.colors.ORANGE)
+            
+            # ====== 変更: データを初期化 ======
+            # 検索前に仕事情報を完全に初期化する
+            self.storage.clear_jobs()
             
             # 取得した仕事情報をJSON形式で保存する（検索のたびに更新）
             self.storage.update_jobs(jobs)

@@ -5,5 +5,7 @@
   "username": "your.email@example.com",
   "password": "",
   "recipient": "",
-  "from_name": "クラウドワークス案件モニター"
+  "from_name": "クラウドワークス案件モニター",
+  "simulation_mode": true,
+  "auto_fallback": true
 }

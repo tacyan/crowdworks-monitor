@@ -123,6 +123,14 @@ class JobStorage:
         """
         return list(self.jobs.values())
     
+    def clear_jobs(self) -> None:
+        """
+        保存されている全ての仕事情報を削除し、空の状態に初期化する
+        """
+        self.jobs = {}
+        self.save_jobs()
+        logger.info("仕事情報を初期化しました")
+    
     def get_jobs_by_ids(self, job_ids: List[str]) -> List[Dict[str, Any]]:
         """
         指定したIDの仕事情報を取得する
